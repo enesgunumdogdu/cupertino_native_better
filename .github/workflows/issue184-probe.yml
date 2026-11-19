@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   probe:
@@ -17,7 +17,7 @@ jobs:
       matrix:
         include:
           - name: before fix (v2.10.1)
-            ref: 165381b
+            ref: 165381b39fa59585d16f09c5b1bf6b78337a1e6d
             expect: --expect-bug
           - name: after fix
             ref: fix/184-search-bar-safe-area
@@ -95,6 +95,27 @@ jobs:
             xcrun simctl io "$UDID" screenshot "shots/shot_$i.png"
           done
 
+      - name: Publish the screenshots to the ci/issue-184-shots branch
+        if: always()
+        working-directory: ci
+        run: |
+          KIND=${{ matrix.expect == '--expect-bug' && 'before' || 'after' }}
+          git config user.name "issue184-probe"
+          git config user.email "issue184-probe@users.noreply.github.com"
+          git fetch -q origin ci/issue-184-shots || true
+          if git rev-parse -q --verify FETCH_HEAD >/dev/null; then
+            git checkout -q -B shots FETCH_HEAD
+          else
+            git checkout -q --orphan shots && git rm -rq . || true
+          fi
+          mkdir -p "$KIND" && rm -f "$KIND"/*.png
+          cp ../shots/*.png "$KIND"/ 2>/dev/null || true
+          git add -A "$KIND" && git commit -qm "shots: $KIND ${{ github.sha }}" || true
+          for i in 1 2 3; do
+            git push -q origin shots:ci/issue-184-shots && break
+            git fetch -q origin ci/issue-184-shots && git rebase -q FETCH_HEAD
+          done
+
       - name: Measure the field's position in its frame
         run: |
           python3 -m venv /tmp/venv
@@ -108,5 +129,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: issue184-${{ matrix.ref == '165381b' && 'before' || 'after' }}
+          name: issue184-${{ matrix.ref == '165381b39fa59585d16f09c5b1bf6b78337a1e6d' && 'before' || 'after' }}
           path: shots/

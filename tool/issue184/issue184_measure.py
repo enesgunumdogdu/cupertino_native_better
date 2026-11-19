@@ -36,6 +36,8 @@ def field_span(img, scale, frame_top_pt):
     hi = min(img.height, int((frame_top_pt + BAR_H_PT + 10) * scale))
     rows = [y for y in range(lo, hi) if is_white(img.getpixel((x, y)))]
     if not rows:
+        samples = [img.getpixel((x, y)) for y in range(lo, hi, max(1, (hi - lo) // 12))]
+        print(f"  no white pixels at x={x}px; samples {samples}")
         return None
     # Group into contiguous runs and keep the longest.
     runs, start, prev = [], rows[0], rows[0]
