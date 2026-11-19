@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ matrix.ref }}
-          path: pkg
+          path: cupertino_native_better
           fetch-depth: 0
 
       - name: Check out the probe
@@ -35,7 +35,7 @@ jobs:
         with:
           path: ci
 
-      - run: cp ci/tool/issue184/issue184_probe_entry.dart pkg/example/lib/
+      - run: cp ci/tool/issue184/issue184_probe_entry.dart cupertino_native_better/example/lib/
 
       - uses: subosito/flutter-action@v2
         with:
@@ -47,23 +47,23 @@ jobs:
         run: |
           xcodebuild -version
           flutter --version
-          git -C pkg log -1 --oneline
+          git -C cupertino_native_better log -1 --oneline
 
       - name: Analyze and format the probe
-        working-directory: pkg/example
+        working-directory: cupertino_native_better/example
         run: |
           flutter pub get
           flutter analyze lib/issue184_probe_entry.dart
           dart format --output=none --set-exit-if-changed lib/issue184_probe_entry.dart
 
       - name: Analyze the package
-        working-directory: pkg
+        working-directory: cupertino_native_better
         run: |
           flutter pub get
           flutter analyze lib
 
       - name: Build for the simulator
-        working-directory: pkg/example
+        working-directory: cupertino_native_better/example
         run: flutter build ios --simulator --debug -t lib/issue184_probe_entry.dart
 
       - name: Boot an iPhone 17 Pro on iOS 26
@@ -85,7 +85,7 @@ jobs:
 
       - name: Run the probe and take a screenshot
         run: |
-          APP=pkg/example/build/ios/iphonesimulator/Runner.app
+          APP=cupertino_native_better/example/build/ios/iphonesimulator/Runner.app
           BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
           xcrun simctl install "$UDID" "$APP"
           xcrun simctl launch "$UDID" "$BUNDLE"
