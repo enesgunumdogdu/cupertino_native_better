@@ -95,27 +95,6 @@ jobs:
             xcrun simctl io "$UDID" screenshot "shots/shot_$i.png"
           done
 
-      - name: Publish the screenshots to the ci/issue-184-shots branch
-        if: always()
-        working-directory: ci
-        run: |
-          KIND=${{ matrix.expect == '--expect-bug' && 'before' || 'after' }}
-          git config user.name "issue184-probe"
-          git config user.email "issue184-probe@users.noreply.github.com"
-          git fetch -q origin ci/issue-184-shots || true
-          if git rev-parse -q --verify FETCH_HEAD >/dev/null; then
-            git checkout -q -B shots FETCH_HEAD
-          else
-            git checkout -q --orphan shots && git rm -rqf --cached . && git clean -fdxq
-          fi
-          mkdir -p "$KIND" && rm -f "$KIND"/*.png
-          cp ../shots/*.png "$KIND"/ 2>/dev/null || true
-          git add -A "$KIND" && git commit -qm "shots: $KIND ${{ github.sha }}" || true
-          for i in 1 2 3; do
-            git push -q origin shots:ci/issue-184-shots && break
-            git fetch -q origin ci/issue-184-shots && git rebase -q FETCH_HEAD
-          done
-
       - name: Measure the field's position in its frame
         run: |
           python3 -m venv /tmp/venv
@@ -123,6 +102,27 @@ jobs:
           for f in shots/*.png; do
             echo "== $f"
             /tmp/venv/bin/python ci/tool/issue184/issue184_measure.py "$f" ${{ matrix.expect }}
+          done
+
+      - name: Publish the screenshots to the ci/issue-184-shots branch
+        if: always()
+        working-directory: ci
+        run: |
+          KIND=${{ matrix.expect == '--expect-bug' && 'before' || 'after' }}
+          git config user.name "issue184-probe"
+          git config user.email "issue184-probe@users.noreply.github.com"
+          if git fetch -q origin ci/issue-184-shots; then
+            git worktree add -q -B shots ../shotsrepo FETCH_HEAD
+          else
+            git worktree add -q --orphan -b shots ../shotsrepo
+          fi
+          cd ../shotsrepo
+          mkdir -p "$KIND" && rm -f "$KIND"/*.png
+          cp ../shots/*.png "$KIND"/ 2>/dev/null || true
+          git add -A "$KIND" && git commit -qm "shots: $KIND ${{ github.sha }}" || true
+          for i in 1 2 3; do
+            git push -q origin shots:ci/issue-184-shots && break
+            git fetch -q origin ci/issue-184-shots && git rebase -q FETCH_HEAD
           done
 
       - name: Upload the screenshots
