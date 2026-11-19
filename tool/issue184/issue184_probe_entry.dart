@@ -7,8 +7,8 @@
 // Two 48 pt bars on a black page, each over a magenta box of its exact
 // frame: "reference" at the top, "overlap" flush with the screen's bottom
 // edge, so the bottom 34 pt of its frame is in the home-indicator area.
-// The bars have a white field, so tool/issue184_measure.py can find the
-// field in a simulator screenshot and compare its centre with the frame's.
+// tool/issue184_measure.py finds the glass field in a simulator screenshot
+// (it shows the magenta darkened) and compares its centre with the frame's.
 
 import 'package:cupertino_native_better/cupertino_native_better.dart';
 import 'package:flutter/cupertino.dart';

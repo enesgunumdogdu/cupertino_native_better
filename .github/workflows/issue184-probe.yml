@@ -106,7 +106,7 @@ jobs:
           if git rev-parse -q --verify FETCH_HEAD >/dev/null; then
             git checkout -q -B shots FETCH_HEAD
           else
-            git checkout -q --orphan shots && git rm -rq . || true
+            git checkout -q --orphan shots && git rm -rqf --cached . && git clean -fdxq
           fi
           mkdir -p "$KIND" && rm -f "$KIND"/*.png
           cp ../shots/*.png "$KIND"/ 2>/dev/null || true
