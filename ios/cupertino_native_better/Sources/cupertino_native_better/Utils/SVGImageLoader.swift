@@ -1,0 +1,203 @@
+import UIKit
+import SVGKit
+import Flutter
+
+/// Centralized SVG image loading utility with caching and error handling
+final class SVGImageLoader {
+    
+    // MARK: - Singleton
+    static let shared = SVGImageLoader()
+    
+    // MARK: - Properties
+    private let cache = NSCache<NSString, UIImage>()
+    private let preloadQueue = DispatchQueue(label: "svg.preload", qos: .userInitiated)
+    /// SVGKit's parser is not thread-safe, and parsing happens both on the
+    /// preload queue and on the main thread. Without this the first SVG the
+    /// app loaded could come back nil while the warm-up parse was running.
+    /// Only parsing is locked: rendering hops to the main thread, and holding
+    /// the lock across that hop could deadlock.
+    private let parseLock = NSLock()
+    
+    // MARK: - Initialization
+    private init() {
+        setupCache()
+        warmUpSVGKit()
+    }
+    
+    // MARK: - Public API
+    
+    /// Load SVG image from Flutter asset path
+    /// - Parameters:
+    ///   - assetPath: Flutter asset path (e.g., "assets/icons/home.svg")
+    ///   - size: Desired size for the SVG
+    /// - Returns: Rendered UIImage or nil if failed
+    func loadSVG(from assetPath: String, size: CGSize = CGSize(width: 24, height: 24)) -> UIImage? {
+        let cacheKey = "\(assetPath)_\(size.width)x\(size.height)" as NSString
+        
+        // Check cache first
+        if let cachedImage = cache.object(forKey: cacheKey) {
+            return cachedImage
+        }
+        
+        // Load from bundle
+        guard let image = loadSVGFromBundle(assetPath: assetPath, size: size) else {
+            return nil
+        }
+        
+        // Cache successful result
+        cache.setObject(image, forKey: cacheKey)
+        return image
+    }
+    
+    /// Load SVG image from raw data
+    /// - Parameters:
+    ///   - data: SVG data bytes
+    ///   - size: Desired size for the SVG
+    /// - Returns: Rendered UIImage or nil if failed
+    func loadSVG(from data: Data, size: CGSize = CGSize(width: 24, height: 24)) -> UIImage? {
+        let cacheKey = "data_\(data.hashValue)_\(size.width)x\(size.height)" as NSString
+        
+        // Check cache first
+        if let cachedImage = cache.object(forKey: cacheKey) {
+            return cachedImage
+        }
+        
+        // Load from data
+        guard let image = loadSVGFromData(data: data, size: size) else {
+            return nil
+        }
+        
+        // Cache successful result
+        cache.setObject(image, forKey: cacheKey)
+        return image
+    }
+    
+    /// Preload SVG assets for better performance
+    /// - Parameter assetPaths: Array of asset paths to preload
+    func preloadAssets(_ assetPaths: [String]) {
+        preloadQueue.async { [weak self] in
+            for path in assetPaths {
+                _ = self?.loadSVG(from: path)
+            }
+        }
+    }
+    
+    /// Preload SVG assets from a list of paths (useful for dynamic preloading)
+    /// - Parameter assetPaths: Array of asset paths to preload
+    func preloadAssetsFromPaths(_ assetPaths: [String]) {
+        guard !assetPaths.isEmpty else { return }
+        preloadAssets(assetPaths)
+    }
+    
+    /// Clear the image cache
+    func clearCache() {
+        cache.removeAllObjects()
+    }
+    
+    // MARK: - Private Methods
+    
+    private func setupCache() {
+        cache.countLimit = 100
+        cache.totalCostLimit = 50 * 1024 * 1024 // 50MB
+    }
+    
+    /// Parses a one-pixel SVG before any real one, synchronously.
+    ///
+    /// SVGKit's `SVGLength +initialize` works out the screen's pixels per
+    /// inch from the device model and, in a build with assertions on (any
+    /// debug build), throws for a model it does not know: every iPhone
+    /// newer than the iPhone 7 and every Apple silicon simulator. The parse
+    /// that first touches `SVGLength` catches that exception as a fatal
+    /// error and returns nil; later parses work. That first parse used to
+    /// be a warm-up on a background queue racing the first real SVG, so the
+    /// first SVG an app showed was missing whenever the real one won (the
+    /// Button page's "Glass Chat" icon on the iOS 26.2 simulator). Doing it
+    /// here, before `shared` returns, makes the warm-up always come first.
+    private func warmUpSVGKit() {
+        let dummySVG = """
+        <svg width="1" height="1" viewBox="0 0 1 1" xmlns="http://www.w3.org/2000/svg">
+            <rect width="1" height="1" fill="transparent"/>
+        </svg>
+        """
+        if let data = dummySVG.data(using: .utf8) {
+            _ = parse { SVGKImage(data: data) }
+        }
+    }
+
+    private func parse(_ make: () -> SVGKImage?) -> SVGKImage? {
+        parseLock.lock()
+        defer { parseLock.unlock() }
+        return make()
+    }
+    
+    private func loadSVGFromBundle(assetPath: String, size: CGSize) -> UIImage? {
+        let flutterKey = FlutterDartProject.lookupKey(forAsset: assetPath)
+        
+        guard let path = Bundle.main.path(forResource: flutterKey, ofType: nil) else {
+            return nil
+        }
+        
+        return loadSVGFromFile(path: path, size: size)
+    }
+    
+    private func loadSVGFromData(data: Data, size: CGSize) -> UIImage? {
+        guard let svgImage = parse({ SVGKImage(data: data) }) else {
+            return nil
+        }
+        
+        return renderSVGImage(svgImage, size: size)
+    }
+    
+    private func loadSVGFromFile(path: String, size: CGSize) -> UIImage? {
+        guard let svgImage = parse({ SVGKImage(contentsOfFile: path) }) else {
+            return nil
+        }
+        
+        return renderSVGImage(svgImage, size: size)
+    }
+    
+    private func renderSVGImage(_ svgImage: SVGKImage, size: CGSize) -> UIImage? {
+        // Ensure we're on the main thread for SVG rendering
+        if Thread.isMainThread {
+            return performSVGRendering(svgImage, size: size)
+        } else {
+            var result: UIImage?
+            DispatchQueue.main.sync {
+                result = performSVGRendering(svgImage, size: size)
+            }
+            return result
+        }
+    }
+    
+    private func performSVGRendering(_ svgImage: SVGKImage, size: CGSize) -> UIImage? {
+        // Set the desired size
+        svgImage.size = size
+        
+        // Force immediate rendering
+        let uiImage = svgImage.uiImage
+        
+        // If still nil, try alternative approach
+        if uiImage == nil {
+            // Sometimes SVGKit needs the size to be set again
+            svgImage.size = size
+            return svgImage.uiImage
+        }
+        
+        return uiImage
+    }
+}
+
+// MARK: - Convenience Extensions
+
+extension SVGImageLoader {
+    
+    /// Load SVG with default 24x24 size
+    func loadSVG(from assetPath: String) -> UIImage? {
+        return loadSVG(from: assetPath, size: CGSize(width: 24, height: 24))
+    }
+    
+    /// Load SVG with default 24x24 size from data
+    func loadSVG(from data: Data) -> UIImage? {
+        return loadSVG(from: data, size: CGSize(width: 24, height: 24))
+    }
+}

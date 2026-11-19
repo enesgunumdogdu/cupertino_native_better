@@ -1,0 +1,2666 @@
+import 'dart:async';
+import 'dart:convert';
+
+// ignore: deprecated_member_use
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+
+import '../channel/params.dart';
+import '../style/sf_symbol.dart';
+import '../style/tab_bar_search_item.dart';
+import '../utils/icon_renderer.dart';
+import '../utils/platform_view_guard.dart';
+import '../utils/popup_menu_encoder.dart';
+import '../utils/popup_menu_fallback_sheet.dart';
+import '../utils/route_changes.dart';
+import '../utils/version_detector.dart';
+import '../utils/theme_helper.dart';
+import '../utils/optional_method_call.dart';
+import '../utils/layout_direction.dart';
+import '../utils/modal_geometry.dart';
+import '../utils/touch_regions.dart';
+import 'icon.dart';
+import 'popup_menu_button.dart';
+import 'tab_badge.dart';
+
+/// Immutable data describing a single tab bar item.
+class CNTabBarItem {
+  /// Creates a tab bar item description.
+  const CNTabBarItem({
+    this.label,
+    this.icon,
+    this.activeIcon,
+    this.badge,
+    this.customIcon,
+    this.activeCustomIcon,
+    this.imageAsset,
+    this.activeImageAsset,
+    this.menuItems,
+    this.semanticLabel,
+    this.onPressed,
+  });
+
+  /// Optional tab item label.
+  final String? label;
+
+  /// The name VoiceOver reads for the tab, in place of [label].
+  ///
+  /// Gives an icon-only tab (no [label]) a name without showing a title:
+  /// `CNTabBarItem(imageAsset: ..., semanticLabel: 'Inbox')` is read as
+  /// "Inbox, tab, 1 of 3". On iOS it is the item's `accessibilityLabel`; on
+  /// macOS the description of the tab's image.
+  final String? semanticLabel;
+
+  /// Makes the item an action, such as Compose or New, instead of a tab.
+  ///
+  /// Tapping the item calls [onPressed]. The item is never selected, the
+  /// selected tab stays as it is, and [CNTabBar.onTap] is not called, so the
+  /// index of an action item is never a valid [CNTabBar.currentIndex]. A
+  /// split bar (`split: true, rightCount: 1`) shows a single action as the
+  /// right-hand capsule, as iOS 26 apps do.
+  ///
+  /// On the iOS 26+ bar a clear button over the item takes the tap before
+  /// the bar can select the item, so no selection highlight shows. When the
+  /// item is reached another way (VoiceOver, or a finger sliding along the
+  /// bar onto it), the bar puts its selection back and calls [onPressed].
+  /// VoiceOver reads the item as a button. The macOS bar and the Flutter
+  /// fallback run the action the same way.
+  final VoidCallback? onPressed;
+
+  /// Optional SF Symbol for the item (unselected state).
+  /// If both [icon] and [customIcon] are provided, [customIcon] takes precedence.
+  final CNSymbol? icon;
+
+  /// Optional SF Symbol for the item when selected.
+  /// If not provided, [icon] is used for both states.
+  final CNSymbol? activeIcon;
+
+  /// Optional badge text to display on the tab bar item.
+  /// On iOS, this displays as a red badge with the text; pass [dotBadge] for
+  /// a small dot without a count. `NSSegmentedControl` has no badges, so on
+  /// macOS the bar draws the same red badge (or dot) at the top-trailing
+  /// corner of the tab, and VoiceOver reads the text as the tab's help.
+  final String? badge;
+
+  /// A [badge] value that shows a small red dot instead of a count, e.g. for
+  /// "something new" on a tab. `UITabBarItem` has no dot badge, so
+  /// `CNTabBar` and `CNTabRail` draw it themselves. VoiceOver reads nothing
+  /// for a dot; say what is new in the tab's [label] if it matters.
+  static const String dotBadge = '\u200B';
+
+  /// Optional custom icon for unselected state.
+  /// Use icons from CupertinoIcons, Icons, or any custom IconData.
+  /// The icon will be rendered to an image at 25pt (iOS standard tab bar icon size)
+  /// and sent to the native platform. If provided, this takes precedence over [icon].
+  ///
+  /// Examples:
+  /// ```dart
+  /// customIcon: CupertinoIcons.house
+  /// customIcon: Icons.home
+  /// ```
+  final IconData? customIcon;
+
+  /// Optional custom icon for selected state.
+  /// If not provided, [customIcon] is used for both states.
+  final IconData? activeCustomIcon;
+
+  /// Optional image asset for unselected state.
+  /// If provided, this takes precedence over [icon] and [customIcon].
+  /// Priority: [imageAsset] > [customIcon] > [icon]
+  final CNImageAsset? imageAsset;
+
+  /// Optional image asset for selected state.
+  /// If not provided, [imageAsset] is used for both states.
+  final CNImageAsset? activeImageAsset;
+
+  /// A menu the item opens instead of selecting itself, with the same
+  /// entries as [CNPopupMenuButton]: items, dividers and submenus.
+  ///
+  /// Tapping the item, or sliding a finger along the bar onto it, opens the
+  /// menu: the item never gets selected nor calls [CNTabBar.onTap], and a
+  /// chosen entry is reported to [CNTabBar.onMenuSelected]. Custom icons
+  /// ([CNPopupMenuItem.customIcon]) are not shown in these menus.
+  ///
+  /// On the iOS 26+ native bar it is a native menu. On the Flutter fallback
+  /// (iOS < 26, Android, web) it opens as a `CupertinoActionSheet`, with a
+  /// further sheet for each submenu, as [CNPopupMenuButton] does. On the
+  /// iOS 26+ bar with a [CNTabBar.searchItem], and on the native macOS bar,
+  /// the item is a plain tab.
+  final List<CNPopupMenuEntry>? menuItems;
+}
+
+/// A Cupertino-native tab bar: a `UITabBar` on iOS 26+, and on every macOS
+/// an `NSSegmentedControl` used as tabs (with the `.tabs` role of macOS 27),
+/// each tab showing its symbol and label, centred at its natural width.
+/// Below iOS 26 and on other platforms it is a [CupertinoTabBar].
+///
+/// On iOS 26+, supports a dedicated search tab: the system search tab at
+/// the end of the bar, which reports when search becomes active, so the app
+/// can show its search UI (see [searchItem]).
+///
+/// Example with search:
+/// ```dart
+/// CNTabBar(
+///   items: [
+///     CNTabBarItem(label: 'Home', icon: CNSymbol('house.fill')),
+///     CNTabBarItem(label: 'Profile', icon: CNSymbol('person.fill')),
+///   ],
+///   currentIndex: _index,
+///   onTap: (i) => setState(() => _index = i),
+///   searchItem: CNTabBarSearchItem(
+///     placeholder: 'Find customer',
+///     onSearchChanged: (query) => filterResults(query),
+///   ),
+/// )
+/// ```
+class CNTabBar extends StatefulWidget {
+  /// Creates a Cupertino-native tab bar.
+  ///
+  /// According to Apple's Human Interface Guidelines, tab bars should contain
+  /// 3-5 tabs for optimal usability. More than 5 tabs can make the interface
+  /// cluttered and reduce tappability.
+  const CNTabBar({
+    super.key,
+    required this.items,
+    required this.currentIndex,
+    required this.onTap,
+    this.tint,
+    this.backgroundColor,
+    this.iconSize,
+    this.height,
+    this.split = false,
+    this.rightCount = 1,
+    this.shrinkCentered = true,
+    this.splitSpacing =
+        12.0, // Apple's recommended spacing for visual separation
+    this.searchItem,
+    this.searchController,
+    this.labelFontFamily,
+    this.labelFontSize,
+    this.labelFontWeight,
+    this.selectedLabelFontWeight,
+    this.textDirection,
+    this.autoHideOnModal = true,
+    this.autoHideOnPageTransition = true,
+    this.onMenuSelected,
+  }) : assert(items.length >= 2, 'Tab bar must have at least 2 items'),
+       assert(
+         items.length <= 5,
+         'Tab bar should have 5 or fewer items for optimal usability',
+       ),
+       assert(rightCount >= 1, 'Right count must be at least 1'),
+       assert(
+         rightCount < items.length || searchItem != null,
+         'Right count must be less than total items',
+       );
+
+  /// Items to display in the tab bar.
+  final List<CNTabBarItem> items;
+
+  /// The index of the currently selected item.
+  final int currentIndex;
+
+  /// Called when the user selects a new item.
+  final ValueChanged<int> onTap;
+
+  /// Accent/tint color.
+  ///
+  /// Colors the selected item (icon + label).
+  final Color? tint;
+
+  /// Background color for the bar.
+  final Color? backgroundColor;
+
+  /// Default icon size when item icon does not specify one.
+  final double? iconSize;
+
+  /// Fixed height; if null uses intrinsic height reported by native view.
+  final double? height;
+
+  /// When true, splits items between left and right sections.
+  ///
+  /// This follows Apple's HIG guidelines for organizing related tab functions
+  /// into logical groups with clear visual separation.
+  ///
+  /// Note: With a [searchItem], the iOS 26+ bar is one bar whose last tab is
+  /// the search tab, and [split] is ignored; the Flutter fallback below
+  /// iOS 26 puts the search button on the right.
+  ///
+  /// macOS has no split tab bar; there the tabs stay in one control.
+  final bool split;
+
+  /// How many trailing items to pin right when [split] is true.
+  ///
+  /// Must be less than the total number of items. Follows Apple's HIG
+  /// recommendation for maintaining balanced visual hierarchy.
+  ///
+  /// On iOS 26+, the right group gets at least 100 pt, so a single item stays
+  /// a circle with its label instead of a narrow pill.
+  ///
+  /// Note: ignored with a [searchItem] (see [split]).
+  final int rightCount; // how many trailing items to pin right when split
+
+  /// When true, centers the split groups more tightly.
+  final bool shrinkCentered;
+
+  /// Gap between left/right halves when split.
+  ///
+  /// Defaults to 12pt following Apple's HIG recommendations for visual separation.
+  /// On iOS 26+, it is the gap between the two glass capsules.
+  final double splitSpacing; // gap between left/right halves when split
+
+  /// Optional search tab configuration.
+  ///
+  /// When provided, adds a dedicated search tab. On iOS 26+ it is the system
+  /// search tab, the last tab of the bar; tapping it, or
+  /// [searchController]'s `activateSearch()`, selects it and calls
+  /// `onSearchActiveChanged(true)`. The bar shows no search field itself, so
+  /// the app shows its own search UI while search is active; for the system
+  /// search field in the tab bar, use `CNTabBarNative`. Its items show their
+  /// images, badges and names as on a bar without search.
+  ///
+  /// On iOS < 26, the Flutter bar expands the search button into a search
+  /// field and collapses the other tabs.
+  /// On macOS the search tab is a trailing tab with the search symbol and
+  /// label; selecting it reports [CNTabBarSearchItem.onSearchActiveChanged]
+  /// (true) instead of [onTap], as the iOS 26 search tab does, and the app
+  /// shows its own search field.
+  final CNTabBarSearchItem? searchItem;
+
+  /// Optional controller for programmatic search management.
+  ///
+  /// Use this to:
+  /// - Activate/deactivate search programmatically
+  /// - Set or clear the search text
+  /// - Listen to search state changes
+  final CNTabBarSearchController? searchController;
+
+  /// Optional custom font family for tab bar item labels.
+  ///
+  /// A font declared under `fonts:` in `pubspec.yaml` works as it is: the
+  /// native bar registers it with the system the first time (#142). A font
+  /// listed in the app's `Info.plist` (`UIAppFonts`) or a system family
+  /// works too. When null, the system default tab bar label font is used.
+  ///
+  /// Example:
+  /// ```dart
+  /// CNTabBar(
+  ///   items: [...],
+  ///   currentIndex: _index,
+  ///   onTap: (i) => setState(() => _index = i),
+  ///   labelFontFamily: 'Roboto',
+  ///   labelFontSize: 11.0,
+  /// )
+  /// ```
+  final String? labelFontFamily;
+
+  /// Optional font size for tab bar item labels.
+  ///
+  /// On the iOS 26 native bar it applies to [labelFontFamily] when set,
+  /// otherwise to the system font. The Flutter fallback applies it only
+  /// together with [labelFontFamily], and the native bar ignores both when
+  /// [searchItem] is set. When null, the system default size is used
+  /// (approximately 10pt on iOS).
+  final double? labelFontSize;
+
+  /// The weight of the labels of the tabs that are not selected. Null keeps
+  /// the system's medium (with [labelFontFamily], the family's nearest face).
+  final FontWeight? labelFontWeight;
+
+  /// The weight of the selected tab's label. Null keeps the system's
+  /// semibold, so the selected tab stands out as on the system bar.
+  final FontWeight? selectedLabelFontWeight;
+
+  /// The direction the native bar lays its tabs out in: the first tab on the
+  /// right for [TextDirection.rtl], with its badges, menus and split halves
+  /// mirrored. Null takes the ambient [Directionality], so an app that
+  /// switches to Arabic in Dart gets a right-to-left native bar as it gets a
+  /// right-to-left fallback bar (#142).
+  final TextDirection? textDirection;
+
+  /// Whether the tab bar automatically hides itself while a modal/sheet is
+  /// presented over its route.
+  ///
+  /// On iOS, the underlying `UITabBar` is rendered as a native UIView via
+  /// hybrid composition. When a Flutter-rendered modal sheet (e.g. one
+  /// shown via `showCupertinoSheet`, `showCupertinoModalPopup`, or
+  /// `showModalBottomSheet`) is presented over the route containing this
+  /// tab bar, the platform view's z-order can interfere with the modal —
+  /// specifically, Flutter-rendered widgets inside the modal (notably
+  /// Material `TextField`s) may appear behind the tab bar's native layer
+  /// and become invisible (Issue #31).
+  ///
+  /// When this is `true` (default), `CNTabBar` listens to its
+  /// [ModalRoute.secondaryAnimation] and renders an empty `SizedBox` in
+  /// place of the platform view while a modal/sheet is on top. When the
+  /// modal is dismissed, the platform view is restored. This matches the
+  /// native iOS pattern where `UITabBarController`'s tab bar is naturally
+  /// hidden during full-screen modal presentations.
+  ///
+  /// Set to `false` if you need the tab bar to remain visible behind
+  /// modals (rare, and typically requires a native-only sheet that won't
+  /// hit the z-order issue).
+  final bool autoHideOnModal;
+
+  /// Whether the tab bar's platform view is hidden from Flutter's scene
+  /// while the enclosing route is animating in or out (e.g. during a
+  /// `CupertinoPageRoute` push or pop). Default: `true`.
+  ///
+  /// When a page containing a `UiKitView` is animated by Flutter, the
+  /// `PlatformViewLayer` overlay can occlude Flutter content elsewhere
+  /// on the page — most visibly, parts of header/text widgets become
+  /// briefly invisible mid-transition (Issue #29 follow-up). This is a
+  /// Flutter hybrid-composition limitation and not something the Swift
+  /// side can fix.
+  ///
+  /// When this is `true`, `CNTabBar` listens to its enclosing
+  /// `ModalRoute.secondaryAnimation` and wraps the platform view in an
+  /// `IndexedStack` while the route is animating (`forward` / `reverse`)
+  /// — the platform view stays MOUNTED (so the native `UITabBar` is not
+  /// destroyed, preserving its state for the return) but isn't painted,
+  /// so its `PlatformViewLayer` doesn't enter the scene and trigger the
+  /// occlusion artifact. When the animation settles the IndexedStack
+  /// switches to paint the platform view again — instant, no recreate
+  /// animation (Issue #35 fix).
+  ///
+  /// Set to `false` to skip the IndexedStack wrap entirely. The platform
+  /// view will be painted continuously through transitions; this can
+  /// re-introduce the page-wide occlusion artifact for content above
+  /// the tab bar.
+  final bool autoHideOnPageTransition;
+
+  /// Called when an entry is chosen in the menu of an item with
+  /// [CNTabBarItem.menuItems]: [index] is the item, [path] the entry, as in
+  /// [CNPopupMenuButton.onPathSelected].
+  final void Function(int index, List<int> path)? onMenuSelected;
+
+  /// Renders the custom icons of [items] ahead of the bar's first mount.
+  ///
+  /// Pass the same [items] and [iconSize] as the bar, so its first build
+  /// reads the rendered icons from cache instead of rasterising them.
+  static Future<void> precacheIcons(
+    List<CNTabBarItem> items, {
+    double? iconSize,
+  }) async {
+    final renders = <Future<Uint8List?>>[];
+    for (final item in items) {
+      if (item.imageAsset == null && item.customIcon != null) {
+        renders.add(
+          iconDataToImageBytes(
+            item.customIcon!,
+            size: _customIconSize(item, iconSize),
+          ),
+        );
+      }
+      if (item.activeImageAsset == null && item.activeCustomIcon != null) {
+        renders.add(
+          iconDataToImageBytes(
+            item.activeCustomIcon!,
+            size: _activeCustomIconSize(item, iconSize),
+          ),
+        );
+      }
+    }
+    await Future.wait(renders);
+  }
+
+  @override
+  State<CNTabBar> createState() => _CNTabBarState();
+}
+
+double _customIconSize(CNTabBarItem item, double? iconSize) =>
+    iconSize ?? item.icon?.size ?? 25.0;
+
+double _activeCustomIconSize(CNTabBarItem item, double? iconSize) =>
+    iconSize ?? item.activeIcon?.size ?? item.icon?.size ?? 25.0;
+
+class _CNTabBarState extends State<CNTabBar> {
+  MethodChannel? _channel;
+  int? _lastIndex;
+  int? _lastTint;
+  int? _lastBg;
+  bool? _lastIsDark;
+  double? _intrinsicHeight;
+  double? _intrinsicWidth;
+
+  /// Where the native bar takes touches, in the platform view's coordinates,
+  /// as it last reported them; null for everywhere (#162). A touch elsewhere
+  /// on the view, such as in the room above the bar or beside the iOS 26
+  /// capsule, goes to the Flutter content behind the bar, as in a native app.
+  List<Rect>? _touchRegions;
+  List<String>? _lastLabels;
+  List<String>? _lastSymbols;
+  List<String>? _lastActiveSymbols;
+  List<String>? _lastBadges;
+  bool? _lastSplit;
+  int? _lastRightCount;
+  double? _lastSplitSpacing;
+  double? _lastIconSize;
+  String? _lastMenusKey;
+
+  /// [_imagesKey] of the items the creation params were prepared from, and
+  /// of the items last sent to the native bar.
+  String? _paramsImagesKey;
+  String? _lastImagesKey;
+  String? _lastItemOptionsKey;
+  String? _lastLabelFontFamily;
+  double? _lastLabelFontSize;
+  int? _lastLabelFontWeight;
+  int? _lastSelectedLabelFontWeight;
+  bool? _lastRtl;
+
+  // Search state
+  bool _isSearchActive = false;
+  String _searchText = '';
+  FocusNode? _searchFocusNode;
+
+  // Issue #31: auto-hide while a modal/sheet is presented over this route.
+  // We listen to a global modal depth counter maintained by
+  // [CNTabBarRouteObserver] (which the user wires into MaterialApp's
+  // navigatorObservers). When depth > 0, a modal/sheet is on top and we
+  // hide the platform view so its native UIView z-order doesn't conflict
+  // with Flutter-rendered modal content (notably Material TextFields).
+  bool _modalUp = false;
+
+  // Issue #29 follow-up: auto-hide while the enclosing route is animating
+  // in/out. Flutter's PlatformViewLayer overlay occludes Flutter content
+  // elsewhere on the page during the transition window; swapping the
+  // platform view for a SizedBox during forward/reverse status makes the
+  // page Flutter-only for the slide, eliminating the artifact.
+  bool _pageTransitioning = false;
+  Animation<double>? _secondaryRouteAnim;
+
+  bool get _isDark => ThemeHelper.isDark(context);
+  Color? get _effectiveTint =>
+      widget.tint ?? ThemeHelper.getPrimaryColor(context);
+
+  // Whether search mode is enabled
+  bool get _hasSearch => widget.searchItem != null;
+
+  // Lifecycle-managed native view preparation.
+  // Async work is kicked off once in initState and guarded by a monotonic
+  // generation token so that stale completions from superseded rebuilds
+  // never feed into the widget tree.
+  Map<String, dynamic>? _creationParams;
+  int _prepGeneration = 0;
+  int _prepRetries = 0;
+  bool _preparing = false;
+
+  /// Native preparation failed and every retry is used up. The bar then
+  /// shows its Flutter fallback instead of the empty slot it keeps while
+  /// preparing, so a failure never leaves the app without a tab bar.
+  bool _prepFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.searchController?.addListener(_onSearchControllerChanged);
+    if (_hasSearch) {
+      _searchFocusNode = FocusNode();
+    }
+    if (!PlatformViewGuard.isReady) {
+      PlatformViewGuard.ensureScheduled();
+      PlatformViewGuard.readyNotifier.addListener(_onPlatformViewGuardReady);
+    }
+    if (widget.autoHideOnModal) {
+      // Split-search variant (iOS 26+) uses an UNCLIPPED native container
+      // so the floating search orb can render above the bar's top edge.
+      // That lets the bar's drop shadow bleed through popup-type sheets
+      // (showCupertinoModalPopup, showModalBottomSheet, showBottomSheet)
+      // which the narrow Sheet-only `modalDepth` heuristic doesn't catch.
+      // For the search variant, listen to the broader `anyModalDepth`
+      // instead so we hide for any modal-like overlay. Regular tab bar
+      // keeps the narrow heuristic (avoids flash on small popups).
+      final depthListenable = _hasSearch
+          ? CNTabBarRouteObserver.anyModalDepth
+          : CNTabBarRouteObserver.modalDepth;
+      depthListenable.addListener(_onModalDepthChanged);
+      _onModalDepthChanged();
+    }
+    _scheduleNativePreparation();
+  }
+
+  void _onModalDepthChanged() {
+    final depth = _hasSearch
+        ? CNTabBarRouteObserver.anyModalDepth.value
+        : CNTabBarRouteObserver.modalDepth.value;
+    final shouldHide = depth > 0;
+    if (shouldHide != _modalUp && mounted) {
+      setState(() => _modalUp = shouldHide);
+    }
+  }
+
+  void _onSecondaryRouteAnimChanged() {
+    final anim = _secondaryRouteAnim;
+    if (anim == null) return;
+    final isAnimating =
+        anim.status == AnimationStatus.forward ||
+        anim.status == AnimationStatus.reverse;
+    if (isAnimating != _pageTransitioning && mounted) {
+      setState(() => _pageTransitioning = isAnimating);
+    }
+  }
+
+  void _attachSecondaryRouteAnim() {
+    if (!widget.autoHideOnPageTransition) return;
+    final route = ModalRoute.of(context);
+    final newAnim = route?.secondaryAnimation;
+    if (identical(newAnim, _secondaryRouteAnim)) return;
+    _secondaryRouteAnim?.removeListener(_onSecondaryRouteAnimChanged);
+    _secondaryRouteAnim = newAnim;
+    _secondaryRouteAnim?.addListener(_onSecondaryRouteAnimChanged);
+    _onSecondaryRouteAnimChanged();
+  }
+
+  @override
+  void didUpdateWidget(covariant CNTabBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Handle controller changes
+    if (oldWidget.searchController != widget.searchController) {
+      oldWidget.searchController?.removeListener(_onSearchControllerChanged);
+      widget.searchController?.addListener(_onSearchControllerChanged);
+    }
+    // Handle search item changes
+    if (_hasSearch && _searchFocusNode == null) {
+      _searchFocusNode = FocusNode();
+    }
+    if (oldWidget.autoHideOnPageTransition != widget.autoHideOnPageTransition) {
+      if (widget.autoHideOnPageTransition) {
+        _attachSecondaryRouteAnim();
+      } else {
+        _secondaryRouteAnim?.removeListener(_onSecondaryRouteAnimChanged);
+        _secondaryRouteAnim = null;
+        if (_pageTransitioning) {
+          _pageTransitioning = false;
+        }
+      }
+    }
+    // Items changed before the native bar was created: its prepared params describe the old items, so
+    // prepare again for these (the stale run is dropped by the generation token).
+    if (_channel == null &&
+        _itemsSignature(oldWidget.items) != _itemsSignature(widget.items)) {
+      _prepGeneration++;
+      _preparing = false;
+      _prepRetries = 0;
+      _prepFailed = false;
+      _creationParams = null;
+      _scheduleNativePreparation();
+    }
+    // A bar given a height doesn't measure itself; when the height goes
+    // back to null (or changes while iOS 26 keeps its own height) it needs
+    // its own size again (#136).
+    if (oldWidget.height != widget.height) _requestIntrinsicSize();
+    _syncPropsToNativeIfNeeded();
+  }
+
+  /// What the native bar is built from, per item, to notice a change of items.
+  static String _itemsSignature(List<CNTabBarItem> items) => items
+      .map(
+        (e) =>
+            '${e.label}|${e.icon?.name}|${e.activeIcon?.name}|'
+            '${e.imageAsset?.assetPath}|${e.activeImageAsset?.assetPath}|'
+            '${e.customIcon?.codePoint}|${e.activeCustomIcon?.codePoint}',
+      )
+      .join('||');
+
+  /// The items' images other than SF Symbols: a change of an image asset or
+  /// a custom icon alone must reach the native bar too.
+  static String _imagesKey(List<CNTabBarItem> items) => items
+      .map(
+        (e) =>
+            '${e.imageAsset?.assetPath}|${e.imageAsset?.imageData?.length}|'
+            '${e.activeImageAsset?.assetPath}|'
+            '${e.activeImageAsset?.imageData?.length}|'
+            '${e.customIcon?.codePoint}|${e.activeCustomIcon?.codePoint}',
+      )
+      .join('||');
+
+  @override
+  void dispose() {
+    _prepGeneration++;
+    PlatformViewGuard.readyNotifier.removeListener(_onPlatformViewGuardReady);
+    widget.searchController?.removeListener(_onSearchControllerChanged);
+    // Remove from both to be safe — removeListener is a no-op if we never
+    // added to one of them (the choice depends on `_hasSearch` at attach
+    // time; searchItem could in theory be added/removed between attach and
+    // dispose).
+    CNTabBarRouteObserver.modalDepth.removeListener(_onModalDepthChanged);
+    CNTabBarRouteObserver.anyModalDepth.removeListener(_onModalDepthChanged);
+    _secondaryRouteAnim?.removeListener(_onSecondaryRouteAnimChanged);
+    _secondaryRouteAnim = null;
+    _searchFocusNode?.dispose();
+    _channel?.setMethodCallHandler(null);
+    _channel = null;
+    super.dispose();
+  }
+
+  void _onPlatformViewGuardReady() {
+    if (!mounted) return;
+    PlatformViewGuard.readyNotifier.removeListener(_onPlatformViewGuardReady);
+    if (_creationParams != null) {
+      setState(() {});
+    }
+  }
+
+  /// Kick off async icon rendering + creation-param assembly exactly once.
+  /// Uses a generation token so that if the widget is disposed or a new
+  /// preparation supersedes this one, the stale result is silently dropped.
+  void _scheduleNativePreparation() {
+    final isIOSOrMacOS =
+        defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.macOS;
+    if (!(isIOSOrMacOS && PlatformVersion.shouldUseNativeControls)) return;
+    if (_preparing) return;
+
+    _preparing = true;
+    final gen = ++_prepGeneration;
+    // The preparation reads widget.items before its first await.
+    final imagesKey = _imagesKey(widget.items);
+
+    _prepareCreationParams()
+        .then((params) {
+          if (!mounted || gen != _prepGeneration) return;
+          setState(() {
+            _creationParams = params;
+            _paramsImagesKey = imagesKey;
+            _preparing = false;
+          });
+        })
+        .catchError((Object e) {
+          if (!mounted || gen != _prepGeneration) return;
+          _preparing = false;
+          // Never stay on the Flutter fallback in silence: say why, and try again a little later (an asset or
+          // the first frame may simply not have been ready yet).
+          debugPrint('[CNTabBar] native preparation failed: $e');
+          if (_prepRetries < 2) {
+            _prepRetries++;
+            Future<void>.delayed(const Duration(milliseconds: 300), () {
+              if (mounted && _creationParams == null) {
+                _scheduleNativePreparation();
+              }
+            });
+          } else {
+            setState(() => _prepFailed = true);
+          }
+        });
+  }
+
+  void _onSearchControllerChanged() {
+    final controller = widget.searchController;
+    if (controller == null) return;
+
+    // Sync controller state to native
+    final ch = _channel;
+    if (ch == null) return;
+
+    try {
+      if (controller.isActive != _isSearchActive) {
+        if (controller.isActive) {
+          unawaited(ch.invokeOptionalMethod('activateSearch'));
+        } else {
+          unawaited(ch.invokeOptionalMethod('deactivateSearch'));
+        }
+        _isSearchActive = controller.isActive;
+      }
+
+      if (controller.text != _searchText) {
+        unawaited(
+          ch.invokeOptionalMethod('setSearchText', {'text': controller.text}),
+        );
+        _searchText = controller.text;
+      }
+    } catch (e) {
+      // Ignore MissingPluginException during hot reload or view recreation
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    assert(
+      widget.items.every((e) => e.menuItems?.isEmpty != true),
+      'CNTabBarItem.menuItems needs at least one entry; pass null for a '
+      'plain item.',
+    );
+    final isIOSOrMacOS =
+        defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.macOS;
+    final shouldUseNative =
+        isIOSOrMacOS && PlatformVersion.shouldUseNativeControls;
+
+    if (!shouldUseNative) {
+      return _buildFlutterFallback(context);
+    }
+
+    final h = widget.height ?? _intrinsicHeight ?? 50.0;
+
+    // Guard against creating platform views too early after hot
+    // restart / cold start.  The engine may not have fully purged
+    // previous-isolate view registrations yet.
+    //
+    // While waiting (guard pending, or async creation params not ready
+    // on the first frame) keep the slot empty: the CupertinoTabBar
+    // fallback would flash the pre-iOS 26 bar before Liquid Glass lands.
+    if (!PlatformViewGuard.isReady) {
+      PlatformViewGuard.ensureScheduled();
+      return SizedBox(height: h);
+    }
+
+    if (_creationParams == null) {
+      return _prepFailed ? _buildFlutterFallback(context) : SizedBox(height: h);
+    }
+
+    // Issue #31: when a modal/sheet is presented over our route, hide
+    // the native tab bar so its UIView z-order can't conflict with
+    // Flutter-rendered modal content. Modal hide must DESTROY the
+    // platform view (return SizedBox) — otherwise the iOS UITabBar
+    // layer keeps rendering above the modal content (TextField
+    // disappears, bar bleeds during sheet drags).
+    //
+    // Issue #29 follow-up + Issue #35 follow-up: when only the route
+    // itself is animating (no modal), use an `IndexedStack` so the
+    // platform view stays MOUNTED but isn't painted. The PlatformView
+    // layer isn't added to the scene that frame, so Flutter's hybrid-
+    // composition overlay doesn't kick in (no occlusion of Flutter
+    // content elsewhere on the page) — AND the native UITabBar isn't
+    // destroyed, so when the transition completes the bar is just
+    // there with the correct selected index, no recreate animation.
+    final hideForModal = _modalUp && widget.autoHideOnModal;
+
+    // Modal hide must DESTROY the platform view — see comment above.
+    if (hideForModal) {
+      return SizedBox(height: h);
+    }
+
+    // _creationParams is built once in initState/_scheduleNativePreparation
+    // and cached forever. When the platform view is destroyed by the modal-
+    // hide path above and then recreated on modal close, the new UITabBar
+    // was being instantiated with the STALE selectedIndex from first mount
+    // (typically 0), causing a visible Liquid-Glass pill animation from
+    // 0 -> widget.currentIndex once the post-create `setSelectedIndex` ran.
+    // Refresh the index field synchronously so the new native bar paints at
+    // the correct tab from the first layout pass — no morph animation.
+    if (_creationParams!['selectedIndex'] != widget.currentIndex) {
+      _creationParams!['selectedIndex'] = widget.currentIndex;
+    }
+    // Same for the split layout: a bar created again after a modal must not
+    // come back with the layout of the first mount.
+    _creationParams!['split'] = _hasSearch ? true : widget.split;
+    _creationParams!['rightCount'] = widget.rightCount;
+    _creationParams!['splitSpacing'] = widget.splitSpacing;
+
+    final platformView = _buildNativeTabBarPlatformView(_creationParams!);
+
+    // Page-transition hide: ALWAYS wrap in IndexedStack when the feature
+    // is on, so the widget tree shape is identical regardless of
+    // `_pageTransitioning`. Only the painted index changes. This keeps
+    // the platform-view child's Element mounted across the toggle —
+    // critical: if we returned `platformView` directly when the
+    // transition ends, the tree shape would change and the UiKitView
+    // would be destroyed and re-created (visible "animate to index" on
+    // return — Issue #35).
+    if (widget.autoHideOnPageTransition) {
+      return IndexedStack(
+        index: _pageTransitioning ? 0 : 1,
+        sizing: StackFit.passthrough,
+        children: [
+          SizedBox(height: h),
+          platformView,
+        ],
+      );
+    }
+    return platformView;
+  }
+
+  Future<List<List<Uint8List?>>> _renderCustomIcons() async {
+    final customIconBytes = <Uint8List?>[];
+    final activeCustomIconBytes = <Uint8List?>[];
+
+    for (final item in widget.items) {
+      // Priority: imageAsset > customIcon > icon
+      if (item.imageAsset != null) {
+        // For imageAsset, we don't need to render to bytes - native code will handle it
+        customIconBytes.add(null);
+      } else if (item.customIcon != null) {
+        // Render at the requested icon size so that bar-level `iconSize`
+        // (and per-item `icon.size` fallback) actually scales custom icons.
+        // Native side embeds these bytes as-is, so the rasterized PNG must
+        // be produced at the target logical size.
+        final bytes = await iconDataToImageBytes(
+          item.customIcon!,
+          size: _customIconSize(item, widget.iconSize),
+        );
+        customIconBytes.add(bytes);
+      } else {
+        customIconBytes.add(null);
+      }
+
+      // Render active custom icon
+      if (item.activeImageAsset != null) {
+        // For activeImageAsset, we don't need to render to bytes - native code will handle it
+        activeCustomIconBytes.add(null);
+      } else if (item.activeCustomIcon != null) {
+        final bytes = await iconDataToImageBytes(
+          item.activeCustomIcon!,
+          size: _activeCustomIconSize(item, widget.iconSize),
+        );
+        activeCustomIconBytes.add(bytes);
+      } else if (item.customIcon != null) {
+        activeCustomIconBytes.add(customIconBytes.last); // Use same as normal
+      } else {
+        activeCustomIconBytes.add(null);
+      }
+    }
+
+    return [customIconBytes, activeCustomIconBytes];
+  }
+
+  /// Prepares all creation params for the native platform view.
+  /// All async work (icon rendering, asset path resolution) happens here,
+  /// guarded by the generation token in the caller. The result is stored
+  /// in [_creationParams] so that [build] can construct the platform view
+  /// synchronously -- eliminating the nested-FutureBuilder race that caused
+  /// duplicate platform-view creation attempts.
+  Future<Map<String, dynamic>> _prepareCreationParams() async {
+    // One snapshot for every step: preparation awaits several times, and an app may change its items in
+    // between (a tab added once its data loads). Reading items after each await mixed the old list
+    // with the new one, indexed past its end and threw, which left the bar on the Flutter fallback.
+    final items = widget.items;
+    // Render custom icons (the only truly async step for most configs)
+    final iconBytes = await _renderCustomIcons();
+    final customIconBytes = iconBytes[0];
+    final activeCustomIconBytes = iconBytes[1];
+
+    if (!mounted) return const {};
+
+    // Capture all context-derived values
+    final capturedDevicePixelRatio = MediaQuery.of(context).devicePixelRatio;
+    final capturedIsDark = _isDark;
+    final capturedRtl = nativeRtl(context, widget.textDirection);
+    final capturedStyle = encodeStyle(context, tint: _effectiveTint);
+    final capturedBackgroundColor = resolveColorToArgb(
+      widget.backgroundColor,
+      context,
+    );
+    final capturedSearchStyle = _hasSearch
+        ? _buildSearchStyleParams(context)
+        : null;
+
+    final labels = items.map((e) => e.label ?? '').toList();
+    final symbols = items.map((e) => e.icon?.name ?? '').toList();
+    final activeSymbols = items
+        .map((e) => e.activeIcon?.name ?? e.icon?.name ?? '')
+        .toList();
+    final badges = items.map((e) => e.badge ?? '').toList();
+
+    final imageAssetPaths = await Future.wait(
+      items.map(
+        (e) async => e.imageAsset != null
+            ? await resolveAssetPathForPixelRatio(e.imageAsset!.assetPath)
+            : '',
+      ),
+    );
+    final activeImageAssetPaths = await Future.wait(
+      items.map(
+        (e) async => e.activeImageAsset != null
+            ? await resolveAssetPathForPixelRatio(e.activeImageAsset!.assetPath)
+            : '',
+      ),
+    );
+
+    if (!mounted) return const {};
+
+    final sizes = items
+        .map((e) => (widget.iconSize ?? e.icon?.size ?? e.imageAsset?.size))
+        .toList();
+    final colors = items
+        .map(
+          (e) =>
+              resolveColorToArgb(e.icon?.color ?? e.imageAsset?.color, context),
+        )
+        .toList();
+
+    final imageAssetData = items.map((e) => e.imageAsset?.imageData).toList();
+    final activeImageAssetData = items
+        .map((e) => e.activeImageAsset?.imageData)
+        .toList();
+    final imageAssetFormats = await Future.wait(
+      items.asMap().entries.map((entry) async {
+        final e = entry.value;
+        if (e.imageAsset == null) return '';
+        final resolvedPath = imageAssetPaths[entry.key];
+        return e.imageAsset!.imageFormat ??
+            detectImageFormat(resolvedPath, e.imageAsset!.imageData) ??
+            '';
+      }),
+    );
+    final activeImageAssetFormats = await Future.wait(
+      items.asMap().entries.map((entry) async {
+        final e = entry.value;
+        if (e.activeImageAsset == null) return '';
+        final resolvedPath = activeImageAssetPaths[entry.key];
+        return e.activeImageAsset!.imageFormat ??
+            detectImageFormat(resolvedPath, e.activeImageAsset!.imageData) ??
+            '';
+      }),
+    );
+
+    if (!mounted) return const {};
+
+    return <String, dynamic>{
+      'labels': labels,
+      'sfSymbols': symbols,
+      'activeSfSymbols': activeSymbols,
+      'badges': badges,
+      'customIconBytes': customIconBytes,
+      'activeCustomIconBytes': activeCustomIconBytes,
+      'imageAssetPaths': imageAssetPaths,
+      'activeImageAssetPaths': activeImageAssetPaths,
+      'imageAssetData': imageAssetData,
+      'activeImageAssetData': activeImageAssetData,
+      'imageAssetFormats': imageAssetFormats,
+      'activeImageAssetFormats': activeImageAssetFormats,
+      'menus': ?_encodeMenus(),
+      ..._itemOptions(items),
+      'iconScale': capturedDevicePixelRatio,
+      'sfSymbolSizes': sizes,
+      'sfSymbolColors': colors,
+      'selectedIndex': widget.currentIndex,
+      'isDark': capturedIsDark,
+      if (widget.labelFontFamily != null)
+        'labelFontFamily': widget.labelFontFamily,
+      if (widget.labelFontSize != null) 'labelFontSize': widget.labelFontSize,
+      if (widget.labelFontWeight != null)
+        'labelFontWeight': widget.labelFontWeight!.value,
+      if (widget.selectedLabelFontWeight != null)
+        'selectedLabelFontWeight': widget.selectedLabelFontWeight!.value,
+      'rtl': ?capturedRtl,
+      'split': _hasSearch ? true : widget.split,
+      'rightCount': widget.rightCount,
+      'splitSpacing': widget.splitSpacing,
+      'style': capturedStyle
+        ..addAll({
+          if (capturedBackgroundColor != null)
+            'backgroundColor': capturedBackgroundColor,
+        }),
+      if (_hasSearch) ...{
+        'hasSearch': true,
+        'searchPlaceholder': widget.searchItem!.placeholder,
+        'searchLabel': widget.searchItem!.label,
+        'searchSymbol': widget.searchItem!.icon?.name ?? 'magnifyingglass',
+        'searchActiveSymbol':
+            widget.searchItem!.activeIcon?.name ??
+            widget.searchItem!.icon?.name ??
+            'magnifyingglass',
+        'automaticallyActivatesSearch':
+            widget.searchItem!.automaticallyActivatesSearch,
+        if (capturedSearchStyle != null) 'searchStyle': capturedSearchStyle,
+      },
+    };
+  }
+
+  Map<String, dynamic> _buildSearchStyleParams(BuildContext context) {
+    final style = widget.searchItem?.style ?? const CNTabBarSearchStyle();
+    return {
+      if (style.iconSize != null) 'iconSize': style.iconSize,
+      if (style.iconColor != null)
+        'iconColor': resolveColorToArgb(style.iconColor, context),
+      if (style.activeIconColor != null)
+        'activeIconColor': resolveColorToArgb(style.activeIconColor, context),
+      if (style.searchBarBackgroundColor != null)
+        'searchBarBackgroundColor': resolveColorToArgb(
+          style.searchBarBackgroundColor,
+          context,
+        ),
+      if (style.searchBarTextColor != null)
+        'searchBarTextColor': resolveColorToArgb(
+          style.searchBarTextColor,
+          context,
+        ),
+      if (style.searchBarPlaceholderColor != null)
+        'searchBarPlaceholderColor': resolveColorToArgb(
+          style.searchBarPlaceholderColor,
+          context,
+        ),
+      if (style.clearButtonColor != null)
+        'clearButtonColor': resolveColorToArgb(style.clearButtonColor, context),
+      if (style.buttonSize != null) 'buttonSize': style.buttonSize,
+      if (style.searchBarHeight != null)
+        'searchBarHeight': style.searchBarHeight,
+      if (style.searchBarBorderRadius != null)
+        'searchBarBorderRadius': style.searchBarBorderRadius,
+      if (style.searchBarPadding != null) ...{
+        'searchBarPaddingLeft': style.searchBarPadding!.left,
+        'searchBarPaddingRight': style.searchBarPadding!.right,
+        'searchBarPaddingTop': style.searchBarPadding!.top,
+        'searchBarPaddingBottom': style.searchBarPadding!.bottom,
+      },
+      if (style.contentPadding != null) ...{
+        'contentPaddingLeft': style.contentPadding!.left,
+        'contentPaddingRight': style.contentPadding!.right,
+        'contentPaddingTop': style.contentPadding!.top,
+        'contentPaddingBottom': style.contentPadding!.bottom,
+      },
+      if (style.spacing != null) 'spacing': style.spacing,
+      if (style.animationDuration != null)
+        'animationDuration': style.animationDuration!.inMilliseconds,
+      'showClearButton': style.showClearButton,
+      if (style.collapsedTabIcon != null)
+        'collapsedTabIcon': style.collapsedTabIcon!.name,
+    };
+  }
+
+  Widget _buildNativeTabBarPlatformView(Map<String, dynamic> creationParams) {
+    const viewType = 'CupertinoNativeTabBar';
+    final nativeView = defaultTargetPlatform == TargetPlatform.iOS
+        ? UiKitView(
+            viewType: viewType,
+            creationParams: creationParams,
+            creationParamsCodec: const StandardMessageCodec(),
+            onPlatformViewCreated: _onCreated,
+            gestureRecognizers: <Factory<OneSequenceGestureRecognizer>>{
+              // Claim every pointer on this platform view unconditionally so
+              // the native tab bar receives taps even when an ancestor holds
+              // an active recognizer of any kind (LongPress, HorizontalDrag,
+              // Tap). A bare TapGestureRecognizer here would be a no-op —
+              // Flutter's TapGestureRecognizer.isPointerAllowed returns false
+              // when no callbacks are set, so it never enters the arena and
+              // an ancestor recognizer wins uncontested (Issue #62 repro:
+              // GestureDetector(onLongPress: () {}, child: CNTabBar(...))).
+              // EagerGestureRecognizer.addAllowedPointer immediately calls
+              // resolve(accepted), so the platform view wins the arena on
+              // pointer-down and touches forward to the native UITabBar.
+              // A tab bar is only tapped, so claiming all gestures over it
+              // (drags/long-presses too) is the intended trade-off.
+              Factory<EagerGestureRecognizer>(() => EagerGestureRecognizer()),
+            },
+          )
+        : AppKitView(
+            viewType: viewType,
+            creationParams: creationParams,
+            creationParamsCodec: const StandardMessageCodec(),
+            onPlatformViewCreated: _onCreated,
+            gestureRecognizers: <Factory<OneSequenceGestureRecognizer>>{
+              // See rationale on the iOS branch above.
+              Factory<EagerGestureRecognizer>(() => EagerGestureRecognizer()),
+            },
+          );
+
+    final platformView = PlatformViewTouchRegions(
+      regions: _touchRegions,
+      child: nativeView,
+    );
+
+    final h = widget.height ?? _intrinsicHeight ?? 50.0;
+    final w = !widget.split && widget.shrinkCentered ? _intrinsicWidth : null;
+    final own = _intrinsicHeight;
+    if (_keepsNativeHeight && own != null && own > h) {
+      return SizedBox(
+        height: h,
+        child: OverflowBox(
+          alignment: Alignment.bottomCenter,
+          minHeight: own,
+          maxHeight: own,
+          child: ClipRect(
+            child: SizedBox(height: own, width: w, child: platformView),
+          ),
+        ),
+      );
+    }
+    return ClipRect(
+      child: SizedBox(height: h, width: w, child: platformView),
+    );
+  }
+
+  void _onCreated(int id) {
+    final ch = MethodChannel('CupertinoNativeTabBar_$id');
+    _channel = ch;
+    // A new native bar reports its own regions after its first layout.
+    if (_touchRegions != null) setState(() => _touchRegions = null);
+    ch.setMethodCallHandler(_onMethodCall);
+    _lastIndex = widget.currentIndex;
+    // The native bar was built from _creationParams, prepared once at the
+    // first mount. Seed the diff state from them, not from the widget, so
+    // props changed since then (a badge, a label, the tint, the theme) are
+    // sent to a bar created again after a modal closes (autoHideOnModal).
+    final params = _creationParams!;
+    final style = params['style'] as Map<String, dynamic>;
+    _lastTint = style['tint'] as int?;
+    _lastBg = style['backgroundColor'] as int?;
+    _lastIsDark = params['isDark'] as bool?;
+    _requestIntrinsicSize();
+    _lastLabels = params['labels'] as List<String>;
+    _lastSymbols = params['sfSymbols'] as List<String>;
+    _lastActiveSymbols = params['activeSfSymbols'] as List<String>;
+    _lastBadges = params['badges'] as List<String>;
+    _lastIconSize = widget.iconSize;
+    _lastImagesKey = _paramsImagesKey;
+    _lastItemOptionsKey = jsonEncode(<String, Object?>{
+      if (params.containsKey('semanticLabels'))
+        'semanticLabels': params['semanticLabels'],
+      if (params.containsKey('actions')) 'actions': params['actions'],
+    });
+    _lastSplit = widget.split;
+    _lastRightCount = widget.rightCount;
+    _lastSplitSpacing = widget.splitSpacing;
+    _lastLabelFontFamily = params['labelFontFamily'] as String?;
+    _lastLabelFontSize = params['labelFontSize'] as double?;
+    _lastLabelFontWeight = params['labelFontWeight'] as int?;
+    _lastSelectedLabelFontWeight = params['selectedLabelFontWeight'] as int?;
+    _lastRtl = params['rtl'] as bool?;
+    _lastMenusKey = _menusKey(params['menus'] as List?);
+    _syncBrightnessIfNeeded();
+    _syncPropsToNativeIfNeeded();
+
+    // Force refresh for label rendering (Issue #6: sporadic missing
+    // labels with 5 items). The Swift-side `refresh` cycles
+    // `bar.selectedItem` through every tab to force UITabBar layout,
+    // then restores the original. We need this on iOS 26 too — the
+    // missing-label bug isn't limited to iOS < 16.
+    //
+    // To avoid the visible "tabs activate in sequence on launch" glitch
+    // (Issue #35), the Swift refresh runs the whole cycle in one main-queue
+    // block without animation, so no intermediate selection reaches the
+    // screen.
+    //
+    // Order matters: setSelectedIndex must run BEFORE refresh on each
+    // pass. Refresh captures `bar.selectedItem` at start and restores
+    // it after cycling — if we ran setSelectedIndex AFTER refresh, that
+    // restore would override our intended index, leaving the bar stuck
+    // at the stale creationParams selectedIndex = 0 (see auto-hide-on-
+    // modal recreation flow).
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      Future.delayed(const Duration(milliseconds: 50), () async {
+        if (mounted && _channel != null) {
+          try {
+            await _channel?.invokeMethod('setSelectedIndex', {
+              'index': widget.currentIndex,
+            });
+            await _channel?.invokeMethod('refresh');
+          } catch (e) {
+            // Ignore MissingPluginException during hot reload or view recreation
+          }
+        }
+      });
+      Future.delayed(const Duration(milliseconds: 200), () async {
+        if (mounted && _channel != null) {
+          try {
+            await _channel?.invokeMethod('setSelectedIndex', {
+              'index': widget.currentIndex,
+            });
+            await _channel?.invokeMethod('refresh');
+          } catch (e) {
+            // Ignore when platform view is being recreated
+          }
+        }
+      });
+    }
+  }
+
+  /// The menu of each item, or null for a plain item; null as a whole when
+  /// no item has one or the bar can't show them.
+  List<Map<String, Object?>?>? _encodeMenus() {
+    // The bar with a search item and the macOS bar keep menu items as plain
+    // tabs and have no `setMenus`.
+    final supported =
+        defaultTargetPlatform == TargetPlatform.iOS && !_hasSearch;
+    if (!supported || !widget.items.any((e) => e.menuItems != null)) {
+      return null;
+    }
+    return [
+      for (final item in widget.items)
+        item.menuItems == null
+            ? null
+            : encodePopupMenuEntries(
+                item.menuItems!,
+                resolveColor: (c) => resolveColorToArgb(c, context),
+                includeCustomIcons: false,
+              ),
+    ];
+  }
+
+  /// The accessibility names and action items, sent with the items; empty
+  /// when no item has either, so bars without them send nothing new.
+  static Map<String, Object?> _itemOptions(List<CNTabBarItem> items) => {
+    if (items.any((e) => (e.semanticLabel ?? '').isNotEmpty))
+      'semanticLabels': [for (final e in items) e.semanticLabel ?? ''],
+    if (items.any((e) => e.onPressed != null))
+      'actions': [
+        for (var i = 0; i < items.length; i++)
+          if (items[i].onPressed != null) i,
+      ],
+  };
+
+  /// Compares encoded menus: entries carry no callback, so their encoding
+  /// tells whether they changed.
+  static String? _menusKey(List? menus) =>
+      menus == null ? null : jsonEncode(menus);
+
+  Future<dynamic> _onMethodCall(MethodCall call) async {
+    if (call.method == 'touchRegions') {
+      final regions = (call.arguments as List?)
+          ?.map((r) => (r as List).cast<num>())
+          .where((r) => r.length == 4)
+          .map(
+            (r) => Rect.fromLTWH(
+              r[0].toDouble(),
+              r[1].toDouble(),
+              r[2].toDouble(),
+              r[3].toDouble(),
+            ),
+          )
+          .toList();
+      final next = regions == null || regions.isEmpty ? null : regions;
+      if (mounted && !listEquals(next, _touchRegions)) {
+        setState(() => _touchRegions = next);
+      }
+    } else if (call.method == 'menuSelected') {
+      final args = call.arguments as Map?;
+      final idx = (args?['index'] as num?)?.toInt();
+      final path = (args?['path'] as List?)?.cast<num>().map((e) => e.toInt());
+      if (idx != null && path != null && path.isNotEmpty) {
+        widget.onMenuSelected?.call(idx, List.unmodifiable(path));
+      }
+    } else if (call.method == 'actionPressed') {
+      final args = call.arguments as Map?;
+      final idx = (args?['index'] as num?)?.toInt();
+      if (idx != null && idx >= 0 && idx < widget.items.length) {
+        widget.items[idx].onPressed?.call();
+      }
+    } else if (call.method == 'valueChanged') {
+      final args = call.arguments as Map?;
+      final idx = (args?['index'] as num?)?.toInt();
+      final action = idx != null && idx >= 0 && idx < widget.items.length
+          ? widget.items[idx].onPressed
+          : null;
+      if (action != null) {
+        // A bar that can't keep an action item from being selected (the
+        // bar with a search item): run the action and put the selection
+        // back.
+        action();
+        _channel
+            ?.invokeMethod('setSelectedIndex', {'index': widget.currentIndex})
+            .catchError((_) {});
+      } else if (idx != null) {
+        // Always fire onTap, even for reselects (Issue #13 fix)
+        widget.onTap(idx);
+        _lastIndex = idx;
+      }
+    } else if (call.method == 'searchTextChanged') {
+      final args = call.arguments as Map?;
+      final text = args?['text'] as String? ?? '';
+      _searchText = text;
+      widget.searchItem?.onSearchChanged?.call(text);
+      widget.searchController?.updateFromNative(text: text);
+    } else if (call.method == 'searchActiveChanged') {
+      final args = call.arguments as Map?;
+      final isActive = args?['isActive'] as bool? ?? false;
+      setState(() => _isSearchActive = isActive);
+      widget.searchItem?.onSearchActiveChanged?.call(isActive);
+      widget.searchController?.updateFromNative(isActive: isActive);
+    } else if (call.method == 'searchSubmitted') {
+      final args = call.arguments as Map?;
+      final text = args?['text'] as String? ?? '';
+      widget.searchItem?.onSearchSubmit?.call(text);
+    }
+    return null;
+  }
+
+  Future<void> _syncPropsToNativeIfNeeded() async {
+    final ch = _channel;
+    if (ch == null) return;
+    // Capture theme-dependent values before awaiting
+    final rtl = nativeRtl(context, widget.textDirection);
+    if (rtl != _lastRtl && rtl != null) {
+      _lastRtl = rtl;
+      unawaited(
+        ch
+            .invokeOptionalMethod('setLayoutDirection', {'rtl': rtl})
+            .catchError((_) {}),
+      );
+    }
+    final idx = widget.currentIndex;
+    final tint = resolveColorToArgb(_effectiveTint, context);
+    final bg = resolveColorToArgb(widget.backgroundColor, context);
+    final iconScale = MediaQuery.of(context).devicePixelRatio;
+    final menus = _encodeMenus();
+
+    final menusKey = _menusKey(menus);
+    if (_lastMenusKey != menusKey) {
+      _lastMenusKey = menusKey;
+      try {
+        await ch.invokeMethod('setMenus', {'menus': menus ?? const []});
+      } catch (_) {
+        // The bar is gone, e.g. hidden under a sheet; it is created again
+        // with its current menus.
+      }
+    }
+
+    try {
+      if (_lastIndex != idx) {
+        await ch.invokeMethod('setSelectedIndex', {'index': idx});
+        _lastIndex = idx;
+      }
+
+      final style = <String, dynamic>{};
+      if (_lastTint != tint && tint != null) {
+        style['tint'] = tint;
+        _lastTint = tint;
+      }
+      if (_lastBg != bg && bg != null) {
+        style['backgroundColor'] = bg;
+        _lastBg = bg;
+      }
+      if (style.isNotEmpty) {
+        await ch.invokeMethod('setStyle', style);
+      }
+
+      // Items update (for hot reload or dynamic changes)
+      final labels = widget.items.map((e) => e.label ?? '').toList();
+      final symbols = widget.items.map((e) => e.icon?.name ?? '').toList();
+      final activeSymbols = widget.items
+          .map((e) => e.activeIcon?.name ?? e.icon?.name ?? '')
+          .toList();
+      final badges = widget.items.map((e) => e.badge ?? '').toList();
+
+      // Fast path: if ONLY badges changed, use lightweight setBadges method
+      final badgesChanged = _lastBadges?.join('|') != badges.join('|');
+      final labelsChanged = _lastLabels?.join('|') != labels.join('|');
+      final symbolsChanged = _lastSymbols?.join('|') != symbols.join('|');
+      final activeSymbolsChanged =
+          _lastActiveSymbols?.join('|') != activeSymbols.join('|');
+      final iconSizeChanged = _lastIconSize != widget.iconSize;
+      final imagesKey = _imagesKey(widget.items);
+      final imagesChanged = _lastImagesKey != imagesKey;
+      final itemOptions = _itemOptions(widget.items);
+      final itemOptionsKey = jsonEncode(itemOptions);
+      final itemOptionsChanged = _lastItemOptionsKey != itemOptionsKey;
+
+      if (badgesChanged &&
+          !labelsChanged &&
+          !symbolsChanged &&
+          !activeSymbolsChanged &&
+          !iconSizeChanged &&
+          !imagesChanged &&
+          !itemOptionsChanged) {
+        // Only badges changed - use lightweight update. No return: a font or
+        // layout change in the same rebuild still has to go out below.
+        await ch.invokeMethod('setBadges', {'badges': badges});
+        _lastBadges = badges;
+      } else if (labelsChanged ||
+          symbolsChanged ||
+          activeSymbolsChanged ||
+          badgesChanged ||
+          iconSizeChanged ||
+          imagesChanged ||
+          itemOptionsChanged) {
+        // Re-render custom icons if items changed
+        final iconBytes = await _renderCustomIcons();
+        final customIconBytes = iconBytes[0];
+        final activeCustomIconBytes = iconBytes[1];
+
+        // Extract imageAsset properties. The paths are resolved for the
+        // pixel ratio, as at creation: the 1x file of an asset with `2.0x` and
+        // `3.0x` variants came out blurred.
+        final imageAssetPaths = await Future.wait(
+          widget.items.map(
+            (e) async => e.imageAsset != null
+                ? await resolveAssetPathForPixelRatio(e.imageAsset!.assetPath)
+                : '',
+          ),
+        );
+        final activeImageAssetPaths = await Future.wait(
+          widget.items.map(
+            (e) async => e.activeImageAsset != null
+                ? await resolveAssetPathForPixelRatio(
+                    e.activeImageAsset!.assetPath,
+                  )
+                : '',
+          ),
+        );
+        if (!mounted || _channel != ch) return;
+        final imageAssetData = widget.items
+            .map((e) => e.imageAsset?.imageData)
+            .toList();
+        final activeImageAssetData = widget.items
+            .map((e) => e.activeImageAsset?.imageData)
+            .toList();
+        // Auto-detect format if not provided
+        final imageAssetFormats = widget.items
+            .map(
+              (e) =>
+                  e.imageAsset?.imageFormat ??
+                  detectImageFormat(
+                    e.imageAsset?.assetPath,
+                    e.imageAsset?.imageData,
+                  ) ??
+                  '',
+            )
+            .toList();
+        final activeImageAssetFormats = widget.items
+            .map(
+              (e) =>
+                  e.activeImageAsset?.imageFormat ??
+                  detectImageFormat(
+                    e.activeImageAsset?.assetPath,
+                    e.activeImageAsset?.imageData,
+                  ) ??
+                  '',
+            )
+            .toList();
+
+        // Compute icon sizes (fix for dynamic iconSize updates)
+        final sizes = widget.items
+            .map((e) => widget.iconSize ?? e.icon?.size ?? e.imageAsset?.size)
+            .toList();
+
+        await ch.invokeMethod('setItems', {
+          'labels': labels,
+          'sfSymbols': symbols,
+          'activeSfSymbols': activeSymbols,
+          'badges': badges,
+          'customIconBytes': customIconBytes,
+          'activeCustomIconBytes': activeCustomIconBytes,
+          'imageAssetPaths': imageAssetPaths,
+          'activeImageAssetPaths': activeImageAssetPaths,
+          'imageAssetData': imageAssetData,
+          'activeImageAssetData': activeImageAssetData,
+          'imageAssetFormats': imageAssetFormats,
+          'activeImageAssetFormats': activeImageAssetFormats,
+          'iconScale': iconScale,
+          'selectedIndex': widget.currentIndex,
+          'sfSymbolSizes': sizes,
+          ...itemOptions,
+        });
+        _lastItemOptionsKey = itemOptionsKey;
+        _lastLabels = labels;
+        _lastSymbols = symbols;
+        _lastActiveSymbols = activeSymbols;
+        _lastBadges = badges;
+        _lastIconSize = widget.iconSize;
+        _lastImagesKey = imagesKey;
+        // Re-measure width in case content changed
+        _requestIntrinsicSize();
+      }
+
+      // Font updates
+      if (_lastLabelFontFamily != widget.labelFontFamily ||
+          _lastLabelFontSize != widget.labelFontSize ||
+          _lastLabelFontWeight != widget.labelFontWeight?.value ||
+          _lastSelectedLabelFontWeight !=
+              widget.selectedLabelFontWeight?.value) {
+        await ch.invokeMethod('setFont', {
+          if (widget.labelFontFamily != null)
+            'labelFontFamily': widget.labelFontFamily,
+          if (widget.labelFontSize != null)
+            'labelFontSize': widget.labelFontSize,
+          if (widget.labelFontWeight != null)
+            'labelFontWeight': widget.labelFontWeight!.value,
+          if (widget.selectedLabelFontWeight != null)
+            'selectedLabelFontWeight': widget.selectedLabelFontWeight!.value,
+        });
+        _lastLabelFontFamily = widget.labelFontFamily;
+        _lastLabelFontSize = widget.labelFontSize;
+        _lastLabelFontWeight = widget.labelFontWeight?.value;
+        _lastSelectedLabelFontWeight = widget.selectedLabelFontWeight?.value;
+        // Another label size changes the bar's size: the macOS bar's width
+        // follows its labels.
+        _requestIntrinsicSize();
+      }
+
+      // Layout updates (split / insets)
+      if (_lastSplit != widget.split ||
+          _lastRightCount != widget.rightCount ||
+          _lastSplitSpacing != widget.splitSpacing) {
+        await ch.invokeMethod('setLayout', {
+          'split': widget.split,
+          'rightCount': widget.rightCount,
+          'splitSpacing': widget.splitSpacing,
+          'selectedIndex': widget.currentIndex,
+        });
+        _lastSplit = widget.split;
+        _lastRightCount = widget.rightCount;
+        _lastSplitSpacing = widget.splitSpacing;
+        _requestIntrinsicSize();
+      }
+    } catch (e) {
+      // Ignore MissingPluginException during hot reload or view recreation
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _attachSecondaryRouteAnim();
+    _syncBrightnessIfNeeded();
+    _syncPropsToNativeIfNeeded();
+  }
+
+  Future<void> _syncBrightnessIfNeeded() async {
+    final ch = _channel;
+    if (ch == null) return;
+    final isDark = _isDark;
+    if (_lastIsDark != isDark) {
+      try {
+        await ch.invokeMethod('setBrightness', {'isDark': isDark});
+        _lastIsDark = isDark;
+      } catch (e) {
+        // Ignore MissingPluginException during hot reload or view recreation
+      }
+    }
+  }
+
+  /// iOS 26 squeezes the native bar when its platform view is shorter than
+  /// the height it measures for itself (about 97 pt on an iPhone 17 Pro, the
+  /// top 14 of them room for the selection pill): with `height: 85` the glass
+  /// capsule came out short and the labels sat on the icons. iOS 27 lays the
+  /// same bar out right. So on iOS 26 a bar given a shorter [CNTabBar.height]
+  /// keeps its own height, aligned to the bottom of the box, and its
+  /// transparent top reaches above it. A taller height is used as it is.
+  ///
+  /// An icon-only bar (no item has a label) has no labels to squeeze, and
+  /// iOS 26 lays it out right at a shorter height, so it is used as it is
+  /// there too (#132).
+  bool get _keepsNativeHeight =>
+      widget.height != null &&
+      defaultTargetPlatform == TargetPlatform.iOS &&
+      PlatformVersion.iosVersion == 26 &&
+      widget.items.any((e) => (e.label ?? '').isNotEmpty);
+
+  Future<void> _requestIntrinsicSize() async {
+    if (widget.height != null && !_keepsNativeHeight) return;
+    final ch = _channel;
+    if (ch == null) return;
+    try {
+      final size = await ch.invokeMethod<Map>('getIntrinsicSize');
+      final h = (size?['height'] as num?)?.toDouble();
+      final w = (size?['width'] as num?)?.toDouble();
+      if (!mounted) return;
+      setState(() {
+        if (h != null && h > 0) _intrinsicHeight = h;
+        // A bar given a height only measures for _keepsNativeHeight and
+        // keeps the width it had.
+        if (w != null && w > 0 && widget.height == null) _intrinsicWidth = w;
+      });
+    } catch (_) {}
+  }
+
+  /// A tap on the Flutter fallback: an item with [CNTabBarItem.menuItems]
+  /// opens its menu as an action sheet instead of being selected.
+  Future<void> _onFallbackTap(int index) async {
+    final action = widget.items[index].onPressed;
+    if (action != null) {
+      action();
+      return;
+    }
+    final menuItems = widget.items[index].menuItems;
+    if (menuItems == null) {
+      widget.onTap(index);
+      return;
+    }
+    final path = await showPopupMenuFallbackSheet(
+      context,
+      menuItems,
+      title: widget.items[index].label,
+    );
+    if (path != null && mounted) {
+      widget.onMenuSelected?.call(index, List.unmodifiable(path));
+    }
+  }
+
+  /// Names an icon-only tab for screen readers ([CNTabBarItem.semanticLabel]).
+  static Widget _withSemanticLabel(CNTabBarItem item, Widget icon) {
+    final name = item.semanticLabel;
+    if (name == null || name.isEmpty) return icon;
+    return Semantics(
+      label: name,
+      child: ExcludeSemantics(child: icon),
+    );
+  }
+
+  /// Builds the Flutter fallback for non-iOS 26+ platforms.
+  /// Includes search functionality when searchItem is provided.
+  Widget _buildFlutterFallback(BuildContext context) {
+    final tintColor = widget.tint ?? ThemeHelper.getPrimaryColor(context);
+    final style = widget.searchItem?.style ?? const CNTabBarSearchStyle();
+
+    // If no search item, just return regular CupertinoTabBar
+    if (!_hasSearch) {
+      Widget tabBar = CupertinoTabBar(
+        items: [
+          for (final item in widget.items)
+            BottomNavigationBarItem(
+              icon: _withSemanticLabel(
+                item,
+                _withBadge(item, _buildTabIcon(item, isActive: false)),
+              ),
+              activeIcon: _withSemanticLabel(
+                item,
+                _withBadge(item, _buildTabIcon(item, isActive: true)),
+              ),
+              label: item.label,
+            ),
+        ],
+        currentIndex: widget.currentIndex,
+        onTap: _onFallbackTap,
+        backgroundColor: widget.backgroundColor,
+        inactiveColor: CupertinoColors.inactiveGray,
+        activeColor: tintColor,
+      );
+
+      // Apply custom font family via CupertinoTheme when specified.
+      // CupertinoTabBar derives its label style from the theme typography.
+      if (widget.labelFontFamily != null) {
+        tabBar = CupertinoTheme(
+          data: CupertinoTheme.of(context).copyWith(
+            textTheme: CupertinoTheme.of(context).textTheme.copyWith(
+              tabLabelTextStyle: TextStyle(
+                fontFamily: widget.labelFontFamily,
+                fontSize: widget.labelFontSize ?? 10.0,
+                fontWeight: widget.labelFontWeight,
+              ),
+            ),
+          ),
+          child: tabBar,
+        );
+      }
+
+      return SizedBox(height: widget.height, child: tabBar);
+    }
+
+    // With search: build a custom layout that mimics iOS 26 behavior
+    final buttonSize = style.buttonSize ?? 44.0;
+    final iconSize = style.iconSize ?? 20.0;
+    final spacing = style.spacing ?? 12.0;
+    final contentPadding =
+        style.contentPadding ??
+        const EdgeInsets.symmetric(horizontal: 16, vertical: 8);
+
+    return Container(
+      height: widget.height ?? 50,
+      padding: contentPadding,
+      child: Row(
+        children: [
+          // Left side: Tab items or collapsed indicator
+          Expanded(
+            child: AnimatedSwitcher(
+              duration:
+                  style.animationDuration ?? const Duration(milliseconds: 400),
+              child: _isSearchActive
+                  ? _buildCollapsedTabIndicator(
+                      context,
+                      tintColor,
+                      buttonSize,
+                      iconSize,
+                      style,
+                    )
+                  : _buildTabItems(context, tintColor),
+            ),
+          ),
+          SizedBox(width: spacing),
+          // Right side: Search button or expanded search bar
+          AnimatedSwitcher(
+            duration:
+                style.animationDuration ?? const Duration(milliseconds: 400),
+            child: _isSearchActive
+                ? _buildExpandedSearchBar(context, tintColor, style)
+                : _buildSearchButton(
+                    context,
+                    tintColor,
+                    buttonSize,
+                    iconSize,
+                    style,
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Old method kept for Flutter fallback compatibility
+  Widget _buildCollapsedTabIndicator(
+    BuildContext context,
+    Color tintColor,
+    double buttonSize,
+    double iconSize,
+    CNTabBarSearchStyle style,
+  ) {
+    final collapsedIcon =
+        style.collapsedTabIcon?.name ??
+        widget.items.first.icon?.name ??
+        'square.grid.2x2';
+
+    return GestureDetector(
+      onTap: () {
+        // Unfocus and close keyboard first
+        _searchFocusNode?.unfocus();
+        setState(() => _isSearchActive = false);
+        widget.searchItem?.onSearchActiveChanged?.call(false);
+        widget.searchController?.updateFromNative(isActive: false);
+        // Notify native iOS to deactivate search
+        final channel = _channel;
+        if (channel != null) {
+          unawaited(channel.invokeOptionalMethod('deactivateSearch'));
+        }
+      },
+      child: Container(
+        width: buttonSize,
+        height: buttonSize,
+        decoration: BoxDecoration(
+          color: CupertinoColors.systemGrey6.resolveFrom(context),
+          borderRadius: BorderRadius.circular(buttonSize / 2),
+        ),
+        child: CNIcon(
+          symbol: CNSymbol(collapsedIcon),
+          size: iconSize,
+          color: style.activeIconColor ?? tintColor,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTabItems(BuildContext context, Color tintColor) {
+    return Container(
+      decoration: BoxDecoration(
+        color: CupertinoColors.systemGrey6.resolveFrom(context),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (int i = 0; i < widget.items.length; i++)
+            Flexible(
+              child: GestureDetector(
+                onTap: () => _onFallbackTap(i),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _withBadge(
+                        widget.items[i],
+                        SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: FittedBox(
+                            child: _buildTabIcon(
+                              widget.items[i],
+                              isActive: widget.currentIndex == i,
+                            ),
+                          ),
+                        ),
+                        inline: true,
+                      ),
+                      if (widget.items[i].label != null &&
+                          widget.items[i].label!.isNotEmpty) ...[
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            widget.items[i].label!,
+                            style: TextStyle(
+                              fontFamily: widget.labelFontFamily,
+                              fontSize: widget.labelFontSize ?? 12,
+                              fontWeight: widget.currentIndex == i
+                                  ? FontWeight.w600
+                                  : FontWeight.normal,
+                              color: widget.currentIndex == i
+                                  ? tintColor
+                                  : CupertinoColors.inactiveGray,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 1,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSearchButton(
+    BuildContext context,
+    Color tintColor,
+    double buttonSize,
+    double iconSize,
+    CNTabBarSearchStyle style,
+  ) {
+    final searchSymbol = widget.searchItem?.icon?.name ?? 'magnifyingglass';
+    final autoActivate =
+        widget.searchItem?.automaticallyActivatesSearch ?? true;
+
+    return GestureDetector(
+      onTap: () {
+        setState(() => _isSearchActive = true);
+        widget.searchItem?.onSearchActiveChanged?.call(true);
+        widget.searchController?.updateFromNative(isActive: true);
+        // Auto-focus search field if enabled
+        if (autoActivate) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _searchFocusNode?.requestFocus();
+          });
+        }
+      },
+      child: Container(
+        width: buttonSize,
+        height: buttonSize,
+        decoration: BoxDecoration(
+          color: CupertinoColors.systemGrey6.resolveFrom(context),
+          borderRadius: BorderRadius.circular(buttonSize / 2),
+        ),
+        child: CNIcon(
+          symbol: CNSymbol(searchSymbol),
+          size: iconSize,
+          color: style.iconColor ?? CupertinoColors.secondaryLabel,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExpandedSearchBar(
+    BuildContext context,
+    Color tintColor,
+    CNTabBarSearchStyle style,
+  ) {
+    final searchSymbol = widget.searchItem?.icon?.name ?? 'magnifyingglass';
+    final padding =
+        style.searchBarPadding ??
+        const EdgeInsets.symmetric(horizontal: 12, vertical: 8);
+
+    return Expanded(
+      child: Container(
+        height: style.searchBarHeight ?? 36,
+        decoration: BoxDecoration(
+          color:
+              style.searchBarBackgroundColor ??
+              CupertinoColors.systemGrey6.resolveFrom(context),
+          borderRadius: BorderRadius.circular(
+            style.searchBarBorderRadius ?? (style.searchBarHeight ?? 36) / 2,
+          ),
+        ),
+        padding: padding,
+        child: Row(
+          children: [
+            CNIcon(
+              symbol: CNSymbol(searchSymbol),
+              size: (style.iconSize ?? 20) * 0.8,
+              color:
+                  style.searchBarPlaceholderColor ??
+                  CupertinoColors.secondaryLabel,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: CupertinoTextField.borderless(
+                focusNode: _searchFocusNode,
+                autofocus: false, // Never auto-focus - we control this manually
+                placeholder: widget.searchItem?.placeholder ?? 'Search',
+                placeholderStyle: TextStyle(
+                  color:
+                      style.searchBarPlaceholderColor ??
+                      CupertinoColors.secondaryLabel,
+                ),
+                style: TextStyle(
+                  color: style.searchBarTextColor ?? CupertinoColors.label,
+                ),
+                onChanged: (text) {
+                  setState(() => _searchText = text);
+                  widget.searchItem?.onSearchChanged?.call(text);
+                  widget.searchController?.updateFromNative(text: text);
+                },
+                onSubmitted: (text) {
+                  widget.searchItem?.onSearchSubmit?.call(text);
+                },
+              ),
+            ),
+            if (style.showClearButton && _searchText.isNotEmpty)
+              GestureDetector(
+                onTap: () {
+                  setState(() => _searchText = '');
+                  widget.searchItem?.onSearchChanged?.call('');
+                  widget.searchController?.updateFromNative(text: '');
+                },
+                child: Icon(
+                  CupertinoIcons.xmark_circle_fill,
+                  size: (style.iconSize ?? 20) * 0.8,
+                  color:
+                      style.clearButtonColor ?? CupertinoColors.secondaryLabel,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Puts [item]'s badge on a fallback [icon] at the size and place
+  /// `UITabBarItem` draws it on iOS 18, measured against the icon's glyph.
+  /// Stacked (icon above label): an 18pt badge whose centre sits 4.5pt past
+  /// the icon's trailing edge, top-aligned with it. [inline] (icon beside
+  /// label, as in landscape): a 14pt badge whose trailing edge is pinned, so
+  /// a longer count grows over the icon, not the label. A dot goes where
+  /// `CNDotTabBar` puts it. Null and empty badges show nothing, as in the
+  /// native `applyBadge`. VoiceOver reads the count as the tab's value; a dot
+  /// has none. The icon keeps the same place in the tree whether or not there
+  /// is a badge, so adding or clearing one does not rebuild it.
+  Widget _withBadge(CNTabBarItem item, Widget icon, {bool inline = false}) {
+    final badge = item.badge;
+    final hasBadge = badge != null && badge.isNotEmpty;
+    final dot = badge == CNTabBarItem.dotBadge;
+    final rtl = Directionality.of(context) == TextDirection.rtl;
+    return Semantics(
+      value: hasBadge && !dot ? badge : null,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          icon,
+          if (hasBadge && dot)
+            const PositionedDirectional(
+              end: -TabBadgeDot.size * 0.35,
+              top: -TabBadgeDot.size * 0.3,
+              child: TabBadgeDot(),
+            )
+          else if (hasBadge && inline)
+            PositionedDirectional(
+              end: -5.5,
+              top: -2.5,
+              child: TabBadge(
+                badge,
+                height: 14,
+                fontSize: 10,
+                fontWeight: FontWeight.w400,
+              ),
+            )
+          else if (hasBadge)
+            PositionedDirectional(
+              end: -4.5,
+              top: 0,
+              child: FractionalTranslation(
+                translation: Offset(rtl ? -0.5 : 0.5, 0),
+                child: TabBadge(
+                  badge,
+                  height: 18,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w400,
+                  padding: 5.5,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Builds an icon widget for the tab bar fallback.
+  /// Priority: imageAsset > customIcon > icon (SF Symbol)
+  ///
+  /// Mirrors the native sizing precedence used in [_prepareCreationParams]:
+  /// bar-level [CNTabBar.iconSize] wins, then per-item icon/imageAsset size,
+  /// finally the standard 25pt tab-bar icon size.
+  Widget _buildTabIcon(CNTabBarItem item, {required bool isActive}) {
+    const defaultSize = 25.0;
+
+    // Check for image asset (highest priority). An asset without a colour of its own takes the bar's active
+    // or inactive colour (CupertinoTabBar's IconTheme), as the native bar tints it; untinted, a template
+    // image drew black.
+    CNImageAsset tinted(CNImageAsset asset, Color? color) =>
+        asset.color != null || color == null
+        ? asset
+        : CNImageAsset(
+            asset.assetPath,
+            imageData: asset.imageData,
+            imageFormat: asset.imageFormat,
+            size: asset.size,
+            color: color,
+            mode: asset.mode,
+            gradient: asset.gradient,
+          );
+    if (isActive && item.activeImageAsset != null) {
+      return Builder(
+        builder: (context) => CNIcon(
+          imageAsset: tinted(
+            item.activeImageAsset!,
+            IconTheme.of(context).color,
+          ),
+          size: widget.iconSize ?? item.activeImageAsset!.size,
+        ),
+      );
+    }
+    if (item.imageAsset != null) {
+      return Builder(
+        builder: (context) => CNIcon(
+          imageAsset: tinted(item.imageAsset!, IconTheme.of(context).color),
+          size: widget.iconSize ?? item.imageAsset!.size,
+        ),
+      );
+    }
+
+    // Check for custom icon (medium priority)
+    if (isActive && item.activeCustomIcon != null) {
+      return Icon(
+        item.activeCustomIcon,
+        size: widget.iconSize ?? item.activeIcon?.size ?? defaultSize,
+      );
+    }
+    if (item.customIcon != null) {
+      return Icon(
+        item.customIcon,
+        size: widget.iconSize ?? item.icon?.size ?? defaultSize,
+      );
+    }
+
+    // Check for SF Symbol (lowest priority)
+    if (isActive && item.activeIcon != null) {
+      return CNIcon(
+        symbol: item.activeIcon,
+        size: widget.iconSize ?? item.activeIcon!.size,
+        color: item.activeIcon!.color,
+      );
+    }
+    if (item.icon != null) {
+      return CNIcon(
+        symbol: item.icon,
+        size: widget.iconSize ?? item.icon!.size,
+        color: item.icon!.color,
+      );
+    }
+
+    // Fallback to empty circle if nothing provided
+    return Icon(CupertinoIcons.circle, size: widget.iconSize ?? defaultSize);
+  }
+}
+
+/// `NavigatorObserver` that lets [CNTabBar] auto-hide while a modal/sheet
+/// is presented over its route (Issue #31).
+///
+/// **Why it exists**: on iOS, `CNTabBar` is rendered as a native UITabBar
+/// inside a Flutter `UiKitView`. When a Flutter-rendered modal sheet is
+/// presented over the same route (e.g. via `showCupertinoSheet`,
+/// `showCupertinoModalPopup`, or `showModalBottomSheet`), Flutter's hybrid
+/// composition can leave the tab bar's UIView at a higher z-index than
+/// the modal's Flutter content — making Material `TextField`s inside the
+/// modal invisible and letting the tab bar bleed through during sheet
+/// drags. (Cupertino has the same trade-off: `UITabBarController` would
+/// solve it natively, but that requires owning the whole nav stack.)
+///
+/// **What it does**: tracks the depth of modal/popup/sheet/dialog routes
+/// on every navigator it's attached to, exposed via [modalDepth]. When
+/// depth > 0, [CNTabBar] (with the default `autoHideOnModal: true`) swaps
+/// its platform view for an empty `SizedBox` of the same height, mirroring
+/// what iOS does natively when a UIViewController presents a full-screen
+/// modal over a UITabBarController.
+///
+/// **Setup** (one line per app):
+/// ```dart
+/// MaterialApp(
+///   navigatorObservers: [CNTabBarRouteObserver()],
+///   // ...
+/// )
+/// ```
+/// or for `CupertinoApp`:
+/// ```dart
+/// CupertinoApp(
+///   navigatorObservers: [CNTabBarRouteObserver()],
+///   // ...
+/// )
+/// ```
+///
+/// Without this observer registered, [CNTabBar] still renders correctly
+/// — it just won't auto-hide when modals are pushed over it, and you may
+/// hit the Issue #31 z-order glitch with Flutter-rendered modal content.
+class CNTabBarRouteObserver extends NavigatorObserver {
+  /// Global modal-depth notifier shared across all [CNTabBarRouteObserver]
+  /// instances. [CNTabBar] listens to this and hides its platform view
+  /// while depth > 0.
+  static final ValueNotifier<int> _modalDepth = ValueNotifier<int>(0);
+
+  /// Read-only listenable of the current modal/sheet depth.
+  static ValueListenable<int> get modalDepth => _modalDepth;
+
+  /// Broader notifier that also counts popups (action sheets, bottom
+  /// sheets, dialogs) — anything that sits above a route as a ModalRoute/
+  /// PopupRoute. Used by [CNButton] (and other iOS 26 glass widgets) to
+  /// enable halo-containment clipping while any kind of sheet/popup is
+  /// on top, not just full-screen "Sheet" routes.
+  static final ValueNotifier<int> _anyModalDepth = ValueNotifier<int>(0);
+
+  /// Read-only listenable of the current sheet/popup/dialog depth (any
+  /// modal-like route, not just full-screen sheets).
+  static ValueListenable<int> get anyModalDepth => _anyModalDepth;
+
+  /// Manually bump [anyModalDepth] up by one. Pair with
+  /// [markAnyModalInactive] once the modal is dismissed. Useful for
+  /// non-route-based overlays that `NavigatorObserver` cannot see —
+  /// notably `Scaffold.showBottomSheet` (persistent bottom sheets),
+  /// which are anchored to Scaffold state instead of the Navigator.
+  ///
+  /// Example:
+  /// ```dart
+  /// final controller = Scaffold.of(context).showBottomSheet(...);
+  /// CNTabBarRouteObserver.markAnyModalActive();
+  /// controller.closed.whenComplete(CNTabBarRouteObserver.markAnyModalInactive);
+  /// ```
+  static void markAnyModalActive() {
+    _anyModalDepth.value = _anyModalDepth.value + 1;
+  }
+
+  /// Pair with [markAnyModalActive]. Clamps at zero.
+  static void markAnyModalInactive() {
+    final next = _anyModalDepth.value - 1;
+    _anyModalDepth.value = next < 0 ? 0 : next;
+  }
+
+  /// Live global rect of the currently-presented top modal sheet, OR null
+  /// when no probe is publishing geometry. Used by `ModalHideMixin` for
+  /// position-aware hide (only widgets whose own rect intersects this rect
+  /// get destroyed, instead of every CN-widget on the host page).
+  ///
+  /// Published by the probe widget injected by `CNBottomSheet.show` (or
+  /// `CNBottomSheet.showCupertino`), or a `CNSheetGeometryProbe`. Without
+  /// one, [routeModalRect] (measured from the modal route) is used.
+  static final ValueNotifier<Rect?> _topModalRect = ValueNotifier<Rect?>(null);
+
+  /// Read-only listenable of the live top-modal sheet rect (see
+  /// [_topModalRect] for details).
+  static ValueListenable<Rect?> get topModalRect => _topModalRect;
+
+  /// Internal API for the probe widget inside `CNBottomSheet`. Pass `null`
+  /// to clear (probe dispose).
+  static void publishTopModalRect(Rect? rect) {
+    _topModalRect.value = rect;
+  }
+
+  /// What the top modal route paints (its sheet, popup or dialog, without
+  /// the barrier), measured from its render tree after every frame while it
+  /// is up, for any API that opened it (#149). While it moves, it also
+  /// covers where it will be a frame later (#156). [Rect.zero] when it
+  /// paints nothing, null when no modal is up or its bounds can't be told.
+  /// [topModalRect], published by a sheet's own probe, takes precedence.
+  static final ValueNotifier<Rect?> _routeModalRect = ValueNotifier<Rect?>(
+    null,
+  );
+
+  /// Read-only listenable of the measured top modal rect (see
+  /// [_routeModalRect]).
+  static ValueListenable<Rect?> get routeModalRect => _routeModalRect;
+
+  /// The top modal's bounds: the published [topModalRect], else the
+  /// measured [routeModalRect]; null when unknown.
+  static Rect? get modalRect => _topModalRect.value ?? _routeModalRect.value;
+
+  /// True while a modal route animates: it is entering, leaving, or being
+  /// dragged.
+  static final ValueNotifier<bool> _modalAnimating = ValueNotifier<bool>(false);
+
+  /// Read-only listenable of [_modalAnimating].
+  static ValueListenable<bool> get modalAnimating => _modalAnimating;
+
+  /// True from the push of a modal route with an entrance animation until
+  /// its bounds have been measured after its first frame ([routeModalRect]).
+  /// It paints next to nothing until then (#156).
+  static final ValueNotifier<bool> _modalBoundsPending = ValueNotifier<bool>(
+    false,
+  );
+
+  /// Read-only listenable of [_modalBoundsPending].
+  static ValueListenable<bool> get modalBoundsPending => _modalBoundsPending;
+  static Route<dynamic>? _pendingRoute;
+
+  /// Notifies after every frame while a modal route animates, once its
+  /// bounds are measured, so widgets under it can follow what the frame did
+  /// to them: some sheets move the page under them (#156).
+  static final ValueNotifier<int> _modalFrame = ValueNotifier<int>(0);
+
+  /// Read-only listenable of [_modalFrame].
+  static Listenable get modalFrame => _modalFrame;
+
+  /// The modal routes counted in [anyModalDepth], oldest first, until their
+  /// exit animation has finished.
+  static final List<Route<dynamic>> _trackedModals = <Route<dynamic>>[];
+  static final Map<Route<dynamic>, AnimationStatusListener> _statusListeners =
+      <Route<dynamic>, AnimationStatusListener>{};
+  static final Set<Route<dynamic>> _animatingModals = <Route<dynamic>>{};
+  static bool _measureArmed = false;
+
+  static bool _isMoving(AnimationStatus status) =>
+      status == AnimationStatus.forward || status == AnimationStatus.reverse;
+
+  /// Whether [route]'s secondary animation follows a modal route counted in
+  /// [anyModalDepth], so a sheet moves it, not a page pushed over it (#161).
+  ///
+  /// A page transitions with the route over it when it can: a page in a
+  /// `PageRouteBuilder` with any page route, a sheet package's sheet route
+  /// too, and any page with a route that has a delegated transition, as
+  /// `showCupertinoSheet`'s has. What covers the page then is the sheet
+  /// ([modalRect]), not its route's whole box ([movingRouteRect]).
+  static bool secondaryAnimationFollowsModal(ModalRoute<dynamic> route) {
+    final driver = _driverOf(route.secondaryAnimation);
+    if (driver == null) return false;
+    for (final modal in _trackedModals) {
+      if (modal is TransitionRoute &&
+          identical(_driverOf(modal.animation), driver)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// The animation that drives [animation]: a modal route's animations are
+  /// proxies (of proxies, for its secondary animation), and a train hopping
+  /// animation follows its current train.
+  static Animation<double>? _driverOf(Animation<double>? animation) {
+    var driver = animation;
+    for (var i = 0; i < 8; i++) {
+      if (driver is ProxyAnimation) {
+        driver = driver.parent;
+      } else if (driver is TrainHoppingAnimation) {
+        driver = driver.currentTrain;
+      } else {
+        break;
+      }
+    }
+    return driver;
+  }
+
+  static void _trackModal(Route<dynamic> route) {
+    if (_trackedModals.contains(route)) return;
+    final animation = route is TransitionRoute ? route.animation : null;
+    if (animation != null && animation.status == AnimationStatus.dismissed) {
+      return;
+    }
+    _trackedModals.add(route);
+    if (animation != null &&
+        animation.status == AnimationStatus.forward &&
+        animation.value == 0) {
+      _pendingRoute = route;
+      _modalBoundsPending.value = true;
+    }
+    if (animation != null) {
+      void onStatus(AnimationStatus status) {
+        if (status == AnimationStatus.dismissed) {
+          _untrackModal(route);
+        } else {
+          _setModalAnimating(route, _isMoving(status));
+        }
+      }
+
+      animation.addStatusListener(onStatus);
+      _statusListeners[route] = onStatus;
+      _setModalAnimating(route, _isMoving(animation.status));
+    }
+    _armModalMeasure();
+  }
+
+  static void _untrackModal(Route<dynamic> route) {
+    if (!_trackedModals.remove(route)) return;
+    if (identical(route, _pendingRoute)) _clearPending();
+    final listener = _statusListeners.remove(route);
+    if (listener != null && route is TransitionRoute) {
+      route.animation?.removeStatusListener(listener);
+    }
+    _setModalAnimating(route, false);
+    // The rect is cleared after the next frame, not here: the depth drops
+    // after this, and an unknown rect in between reads as "covered".
+    _armModalMeasure();
+  }
+
+  static void _setModalAnimating(Route<dynamic> route, bool moving) {
+    if (moving) {
+      _animatingModals.add(route);
+    } else {
+      _animatingModals.remove(route);
+    }
+    _modalAnimating.value = _animatingModals.isNotEmpty;
+  }
+
+  /// Measures the top modal after the next frame, and again after each
+  /// frame while one is up. Frames come only while something changes, so
+  /// a modal at rest costs nothing.
+  static void _armModalMeasure() {
+    if (_measureArmed) return;
+    _measureArmed = true;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      _measureArmed = false;
+      if (_trackedModals.isEmpty) {
+        _measuredRoute = null;
+        _measuredRect = null;
+        _routeModalRect.value = null;
+        _clearPending();
+        return;
+      }
+      final top = _trackedModals.last;
+      final rect = top is ModalRoute ? _modalContentRect(top) : null;
+      // Led only while the route's animation moves it: its last frame is
+      // measured at rest.
+      final previous =
+          identical(top, _measuredRoute) && _animatingModals.contains(top)
+          ? _measuredRect
+          : null;
+      _measuredRoute = top;
+      _measuredRect = rect;
+      _routeModalRect.value = _leadingMotion(rect, previous);
+      // After the bounds, so their listeners see both.
+      if (identical(top, _pendingRoute)) _clearPending();
+      if (_animatingModals.isNotEmpty) _modalFrame.value++;
+      _armModalMeasure();
+    });
+  }
+
+  static void _clearPending() {
+    _pendingRoute = null;
+    _modalBoundsPending.value = false;
+  }
+
+  /// What [route] paints ([modalRouteContentRect]). A sheet route that is a
+  /// page route is offstage for the first frame of its push (the hero
+  /// controller does that), laid out where its transition ends, and stays
+  /// laid out there until a frame lays it out again: it paints nothing
+  /// then, so [Rect.zero], not the open sheet (#161).
+  static Rect? _modalContentRect(ModalRoute<dynamic> route) {
+    if (route.offstage || _layoutPending.contains(route)) return Rect.zero;
+    return modalRouteContentRect(route);
+  }
+
+  /// The top modal route last measured, and what it painted then.
+  static Route<dynamic>? _measuredRoute;
+  static Rect? _measuredRect;
+
+  /// [rect], grown to where the modal will be a frame later if it keeps
+  /// moving as it did since [previous] (#156). The bounds are measured after
+  /// a frame, so a widget acting on them would otherwise be a frame behind
+  /// a sheet sliding towards it. Without [previous], [rect] itself.
+  static Rect? _leadingMotion(Rect? rect, Rect? previous) {
+    if (rect == null || previous == null || rect == previous) return rect;
+    if (rect.isEmpty || previous.isEmpty) return rect;
+    return rect.expandToInclude(
+      Rect.fromLTRB(
+        rect.left * 2 - previous.left,
+        rect.top * 2 - previous.top,
+        rect.right * 2 - previous.right,
+        rect.bottom * 2 - previous.bottom,
+      ),
+    );
+  }
+
+  /// Where the page route moving over or off another page is, measured
+  /// after every frame while it moves: pushed, popped, or dragged by the
+  /// back gesture (#159). The glass widgets on the page under it hide only
+  /// the part of their glow it covers, instead of clipping all of it until
+  /// the transition ends. While it moves, it also covers where it will be a
+  /// frame later. Null while no page route moves, or when its bounds can't
+  /// be told.
+  static final ValueNotifier<Rect?> _movingRouteRect = ValueNotifier<Rect?>(
+    null,
+  );
+
+  /// Read-only listenable of [_movingRouteRect].
+  static ValueListenable<Rect?> get movingRouteRect => _movingRouteRect;
+
+  /// The page route [movingRouteRect] was measured from, so a widget can
+  /// tell it moves in its own navigator.
+  static ModalRoute<dynamic>? get movingRoute =>
+      _movingRouteRect.value == null ? null : _movingMeasured;
+
+  /// The page routes whose animation is watched, with their listeners.
+  static final Map<Route<dynamic>, AnimationStatusListener> _routeWatchers =
+      <Route<dynamic>, AnimationStatusListener>{};
+
+  /// The watched routes moving now, in the order they started.
+  static final List<ModalRoute<dynamic>> _movingRoutes =
+      <ModalRoute<dynamic>>[];
+  static bool _movingMeasureArmed = false;
+  static ModalRoute<dynamic>? _movingMeasured;
+  static Rect? _movingMeasuredRect;
+
+  /// Watches [route]'s animation while it is in the navigator, so its moves
+  /// are measured. Popups, dialogs and sheets on a popup route don't move
+  /// the page under them, and the modal rules cover them.
+  static void _watchRoute(Route<dynamic> route) {
+    if (route is! ModalRoute || route is PopupRoute) return;
+    if (_routeWatchers.containsKey(route)) return;
+    final animation = route.animation;
+    if (animation == null) return;
+    void onStatus(AnimationStatus status) {
+      if (status == AnimationStatus.dismissed) {
+        _unwatchRoute(route);
+      } else {
+        _setRouteMoving(route, _isMoving(status));
+      }
+    }
+
+    animation.addStatusListener(onStatus);
+    _routeWatchers[route] = onStatus;
+    _setRouteMoving(route, _isMoving(animation.status));
+  }
+
+  static void _unwatchRoute(Route<dynamic> route) {
+    _wasOffstage.remove(route);
+    _layoutPending.remove(route);
+    final listener = _routeWatchers.remove(route);
+    if (listener != null && route is TransitionRoute) {
+      route.animation?.removeStatusListener(listener);
+    }
+    if (route is ModalRoute) _setRouteMoving(route, false);
+  }
+
+  /// The routes that stopped moving because they went offstage.
+  static final Set<Route<dynamic>> _wasOffstage = <Route<dynamic>>{};
+
+  /// The routes back from offstage that no frame has laid out since: they
+  /// are laid out where their transition ends, and have painted nothing.
+  static final Set<Route<dynamic>> _layoutPending = <Route<dynamic>>{};
+
+  static void _setRouteMoving(ModalRoute<dynamic> route, bool moving) {
+    if (!moving && route.offstage) _wasOffstage.add(route);
+    if (moving) {
+      if (_movingRoutes.contains(route)) return;
+      _movingRoutes.add(route);
+      // Where it is now: a page popped or dragged back is laid out where it
+      // stands, and a page pushed has painted nothing yet. Back from an
+      // offstage frame, it is laid out where it will end until the next
+      // frame: it has painted nothing yet either.
+      if (_wasOffstage.remove(route)) {
+        _layoutPending.add(route);
+        // Runs after the next frame, which lays it out where it is, also
+        // when this runs among the post-frame callbacks of the frame before.
+        SchedulerBinding.instance.addPostFrameCallback(
+          (_) => _layoutPending.remove(route),
+        );
+      }
+      _movingMeasured = route;
+      _movingMeasuredRect = _pageRect(route);
+      _movingRouteRect.value = _movingMeasuredRect;
+      _armMovingMeasure();
+    } else if (_movingRoutes.remove(route) && _movingRoutes.isEmpty) {
+      // Cleared after the frame: the hero controller makes a pushed route
+      // offstage for its first frame, which stops and restarts its
+      // animation within it.
+      _armMovingMeasure();
+    }
+  }
+
+  /// Measures the last route that started moving after the next frame, and
+  /// after each frame while it moves.
+  static void _armMovingMeasure() {
+    if (_movingMeasureArmed) return;
+    _movingMeasureArmed = true;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      _movingMeasureArmed = false;
+      // A navigator disposed with its routes reports nothing more.
+      for (final route in List<ModalRoute<dynamic>>.of(_movingRoutes)) {
+        if (route.navigator == null) _unwatchRoute(route);
+      }
+      if (_movingRoutes.isEmpty) {
+        _movingMeasured = null;
+        _movingMeasuredRect = null;
+        _movingRouteRect.value = null;
+        return;
+      }
+      final route = _movingRoutes.last;
+      final rect = _pageRect(route);
+      final previous = identical(route, _movingMeasured)
+          ? _movingMeasuredRect
+          : null;
+      _movingMeasured = route;
+      _movingMeasuredRect = rect;
+      _movingRouteRect.value = _leadingMotion(rect, previous);
+      // Frames come only while it moves, so a finger holding the back
+      // gesture still costs nothing.
+      _armMovingMeasure();
+    });
+  }
+
+  /// The global bounds of [route]'s page as its transition places it now. A
+  /// page paints its whole box, so its box is enough. [Rect.zero] while it
+  /// is offstage or hasn't been laid out: it paints nothing.
+  static Rect _pageRect(ModalRoute<dynamic> route) {
+    if (route.offstage || _layoutPending.contains(route)) return Rect.zero;
+    final box = route.subtreeContext?.findRenderObject();
+    if (box is! RenderBox) return Rect.zero;
+    return globalBoundsOf(box) ?? Rect.zero;
+  }
+
+  /// Heuristic for "is this route a full-screen-ish sheet that should
+  /// trigger tab-bar auto-hide?". Intentionally narrow: only matches
+  /// routes whose runtime type name contains `Sheet`. This catches the
+  /// two full-screen-ish sheet routes that benefit from auto-hide:
+  ///   - `CupertinoSheetRoute` (PageRoute, full-screen Cupertino sheet)
+  ///   - `ModalBottomSheetRoute` (PopupRoute, Material bottom sheet)
+  ///
+  /// Routes we intentionally DO NOT match here:
+  ///   - `CupertinoModalPopupRoute` / other action-sheet popups: they
+  ///     cover only a small portion of the screen and dismiss quickly,
+  ///     making the platform-view recreate-and-restore visible as an
+  ///     ugly index-jump animation. The Swift-side `clipsToBounds = true`
+  ///     containment (Issue #2 fix) handles the shadow z-order on its
+  ///     own here, so we don't need to hide.
+  ///   - `DialogRoute` / `RawDialogRoute`: dialogs sit center-screen and
+  ///     do not fully cover the tab bar; their scrim handles dimming.
+  ///   - Regular `PageRoute` pushes (Material/Cupertino page routes):
+  ///     the new page replaces the current view entirely, so the tab
+  ///     bar is offscreen anyway.
+  bool _isModal(Route<dynamic> route) {
+    return route.runtimeType.toString().contains('Sheet');
+  }
+
+  /// Broader predicate: matches any modal-like route that visually covers
+  /// (fully or partially) the underlying page. Used to drive the halo-
+  /// containment counter for non-tab-bar glass widgets.
+  bool _isAnyModal(Route<dynamic> route) {
+    if (route is PopupRoute) return true;
+    final name = route.runtimeType.toString();
+    return name.contains('Sheet') ||
+        name.contains('Popup') ||
+        name.contains('Dialog');
+  }
+
+  void _bumpUp(Route<dynamic> route) {
+    if (_isModal(route)) {
+      _modalDepth.value = _modalDepth.value + 1;
+    }
+    if (_isAnyModal(route)) {
+      // Tracked first, so listeners of the depth see it animating.
+      _trackModal(route);
+      _anyModalDepth.value = _anyModalDepth.value + 1;
+    }
+  }
+
+  void _bumpDown(Route<dynamic> route, {bool deferAnyModal = false}) {
+    if (_isModal(route)) {
+      // Narrow counter stays synchronous: CNTabBar unmounts on this signal
+      // and its pixels disappear the same frame as `Navigator.pop()`, so it
+      // has no halo race to worry about.
+      final next = _modalDepth.value - 1;
+      _modalDepth.value = next < 0 ? 0 : next;
+    }
+    if (_isAnyModal(route)) {
+      // Broad counter drives CNButton's native iOS 26 halo-containment clip.
+      // Releasing the clip synchronously at t=0 of the route's exit animation
+      // lets the Liquid Glass halo leak outside the platform-view bounds for
+      // the 1+ frames before the sheet's pixels clear (Issue #37). Defer the
+      // decrement until the route's exit animation reports `dismissed` so the
+      // clip stays ON for the entire visual duration of the close.
+      if (deferAnyModal) {
+        _decrementAnyModalWhenDismissed(route);
+      } else {
+        _untrackModal(route);
+        final next = _anyModalDepth.value - 1;
+        _anyModalDepth.value = next < 0 ? 0 : next;
+      }
+    }
+  }
+
+  /// Decrement [_anyModalDepth] only when [route]'s animation has fully
+  /// dismissed. If no animation is attached, or it is already dismissed
+  /// (e.g. an instant / synthetic pop), decrement immediately.
+  void _decrementAnyModalWhenDismissed(Route<dynamic> route) {
+    void decrement() {
+      final next = _anyModalDepth.value - 1;
+      _anyModalDepth.value = next < 0 ? 0 : next;
+    }
+
+    // `animation` is defined on TransitionRoute (which all modal/popup/page
+    // routes extend), not on the base Route. For any non-TransitionRoute
+    // (synthetic / instant pops) just decrement now.
+    final anim = route is TransitionRoute ? route.animation : null;
+    if (anim == null || anim.status == AnimationStatus.dismissed) {
+      decrement();
+      return;
+    }
+    late void Function(AnimationStatus) listener;
+    listener = (status) {
+      if (status == AnimationStatus.dismissed) {
+        anim.removeStatusListener(listener);
+        decrement();
+      }
+    };
+    anim.addStatusListener(listener);
+  }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _bumpUp(route);
+    _watchRoute(route);
+    notifyCNRouteChange();
+  }
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    // Defer ONLY the broad _anyModalDepth decrement; the narrow _modalDepth
+    // path remains synchronous inside _bumpDown.
+    _bumpDown(route, deferAnyModal: true);
+    // Watched since its push; also when it was pushed before this observer.
+    _watchRoute(route);
+    notifyCNRouteChange();
+  }
+
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    // didRemove represents a non-animated removal; deferring would never fire.
+    _bumpDown(route);
+    _unwatchRoute(route);
+    notifyCNRouteChange();
+  }
+
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
+    // Replaced route's pixels are immediately gone; keep synchronous.
+    if (oldRoute != null) {
+      _bumpDown(oldRoute);
+      _unwatchRoute(oldRoute);
+    }
+    if (newRoute != null) {
+      _bumpUp(newRoute);
+      _watchRoute(newRoute);
+    }
+    notifyCNRouteChange();
+  }
+}

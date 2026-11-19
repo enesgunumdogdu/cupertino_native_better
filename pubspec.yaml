@@ -1,0 +1,48 @@
+name: cupertino_native_better
+description: "The real iOS 26 and iOS 27 Liquid Glass controls in Flutter: native tab bars, buttons, menus, sliders, switches, alerts and sheets, with Cupertino fallbacks."
+version: 2.10.1
+homepage: https://github.com/gunumdogdu/cupertino_native_better
+repository: https://github.com/gunumdogdu/cupertino_native_better
+issue_tracker: https://github.com/gunumdogdu/cupertino_native_better/issues
+documentation: https://gunumdogdu.com/docs
+
+topics:
+  - ios
+  - macos
+  - cupertino
+  - liquid-glass
+  - native-widgets
+
+screenshots:
+  - description: 'Native iOS 26 and iOS 27 controls in Flutter apps: settings, files, photos, music and account screens'
+    path: screenshots/showcase.jpg
+  - description: 'A settings page built from the native segmented control, slider, switches and pop-up menu, switching to dark mode'
+    path: screenshots/display.gif
+  - description: 'The native tab bar and a pop-up menu with a Sort By submenu'
+    path: screenshots/files.gif
+  - description: 'CNTabBarNative: the tab bar minimizes on scroll, with a now-playing accessory'
+    path: screenshots/music.gif
+  - description: 'iPhone Duo: tabs in the vertical bar when closed, and a layout split at the fold'
+    path: screenshots/iphone_duo.gif
+
+environment:
+  sdk: ^3.9.0
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  plugin_platform_interface: ^2.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  plugin:
+    platforms:
+      ios:
+        pluginClass: CupertinoNativePlugin
+      macos:
+        pluginClass: CupertinoNativePlugin

@@ -1,0 +1,1143 @@
+import Flutter
+import UIKit
+
+class CupertinoPopupMenuButtonPlatformView: NSObject, FlutterPlatformView {
+  private let channel: FlutterMethodChannel
+  private let container: CNLayoutReportingView
+  private let button: CNPopupMenuUIButton
+  private var currentButtonStyle: String = "automatic"
+  private var isRoundButton: Bool = false
+  private var isTransitioning: Bool = false
+  private var labels: [String] = []
+  private var symbols: [String] = []
+  private var customIconBytes: [Data?] = []
+  private var customIconColors: [Any] = []
+  private var imageAssetPaths: [String] = []
+  private var imageAssetData: [Data?] = []
+  private var imageAssetFormats: [String] = []
+  private var dividers: [Bool] = []
+  private var enabled: [Bool] = []
+  private var checked: [Bool] = []
+  // Issue #55: per-item destructive flag. When true, the menu action is
+  // built with `UIMenuElement.Attributes.destructive` so iOS renders the
+  // label (not just the icon) in the system red destructive color.
+  private var isDestructive: [Bool] = []
+  private var itemSizes: [Any] = []
+  private var itemColors: [Any] = []
+  private var itemModes: [String?] = []
+  private var itemPalettes: [[NSNumber]] = []
+  private var itemGradients: [NSNumber?] = []
+  // Subtitles and submenus. Flutter only sends them when the menu uses
+  // them; each submenu arrives as its own level, encoded like the top one.
+  private var subtitles: [String] = []
+  private var isSubmenu: [Bool] = []
+  private var submenus: [[String: Any]?] = []
+  // Items that keep the menu open, and submenus shown in place. Also only
+  // sent when used.
+  private var keepsMenuPresented: [Bool] = []
+  private var submenuStyles: [String?] = []
+  private var elementSizes: [String?] = []
+  private var checkedImages: [Bool] = []
+  private var iconScale: CGFloat = UIScreen.main.scale
+  private var preserveTopToBottomOrder: Bool = false
+  // Track current button icon configuration to keep image across state updates
+  private var btnIconName: String? = nil
+  private var btnCustomIconBytes: Data? = nil
+  private var btnAssetPath: String? = nil
+  private var btnImageData: Data? = nil
+  private var btnImageFormat: String? = nil
+  private var btnIconSize: CGFloat? = nil
+  private var btnIconColor: UIColor? = nil
+  private var btnIconMode: String? = nil
+  private var btnIconPalette: [UIColor] = []
+  /// The title, kept so an icon change doesn't drop it (#141).
+  private var currentTitle: String? = nil
+  /// The newest title Flutter sent, set at once or held until the view has
+  /// its width (#166).
+  private var requestedTitle: String? = nil
+  /// `CNPopupMenuButton.imagePlacement` / `imagePadding` for a button with
+  /// both a title and an image (#141).
+  private var imagePlacement: NSDirectionalRectEdge = .leading
+  private var imagePadding: CGFloat? = nil
+  /// `CNPopupMenuButton.contentPadding`: the button's content insets on every
+  /// style, zeros included; nil keeps the style's (#169).
+  private var contentInsets: NSDirectionalEdgeInsets? = nil
+  /// `labelFontFamily` / `labelFontSize` / `labelFontWeight` / `labelColor`.
+  private var labelFontFamily: String? = nil
+  private var labelFontSize: CGFloat? = nil
+  private var labelFontWeight: Int? = nil
+  private var labelColor: UIColor? = nil
+  /// The label colour on light and on dark glass (#153).
+  private var labelColorLight: UIColor? = nil
+  private var labelColorDark: UIColor? = nil
+  /// Changes held until the view has a given width: a new title with the
+  /// width it needs, or the first appearance at the measured width (#147).
+  private var widthActions: [(id: Int, width: CGFloat, run: () -> Void)] = []
+  private var nextWidthActionId = 0
+
+  init(frame: CGRect, viewId: Int64, args: Any?, messenger: FlutterBinaryMessenger) {
+    self.channel = FlutterMethodChannel(name: "CupertinoNativePopupMenuButton_\(viewId)", binaryMessenger: messenger)
+    self.container = CNLayoutReportingView(frame: frame)
+    self.button = CNPopupMenuUIButton(type: .system)
+
+    var title: String? = nil
+    var semanticLabel: String? = nil
+    var iconName: String? = nil
+    var iconSize: CGFloat? = nil
+    var iconColor: UIColor? = nil
+    var makeRound: Bool = false
+    var isDark: Bool = false
+    var tint: UIColor? = nil
+    var buttonStyle: String = "automatic"
+    var labels: [String] = []
+    var symbols: [String] = []
+    var customIconBytes: [Data?] = []
+    var customIconColors: [Any] = []
+    var dividers: [NSNumber] = []
+    var enabled: [NSNumber] = []
+    var sizes: [Any] = []
+    var colors: [Any] = []
+    var iconScale: CGFloat = UIScreen.main.scale
+    var buttonIconMode: String? = nil
+    var buttonIconPalette: [NSNumber] = []
+    var buttonCustomIconBytes: Data? = nil
+    var hiddenUntilSized = false
+
+    var itemFontFamily: String?
+    if let dict = args as? [String: Any] {
+      hiddenUntilSized = (dict["hiddenUntilSized"] as? NSNumber)?.boolValue ?? false
+      if let t = dict["buttonTitle"] as? String { title = t }
+      switch dict["imagePlacement"] as? String {
+      case "trailing": self.imagePlacement = .trailing
+      case "top": self.imagePlacement = .top
+      case "bottom": self.imagePlacement = .bottom
+      default: self.imagePlacement = .leading
+      }
+      if let v = dict["imagePadding"] as? NSNumber { self.imagePadding = CGFloat(v.doubleValue) }
+      if let v = dict["contentInsets"] as? [NSNumber], v.count == 4 {
+        self.contentInsets = NSDirectionalEdgeInsets(
+          top: CGFloat(truncating: v[0]), leading: CGFloat(truncating: v[1]),
+          bottom: CGFloat(truncating: v[2]), trailing: CGFloat(truncating: v[3]))
+      }
+      if let f = dict["labelFontFamily"] as? String, !f.isEmpty { self.labelFontFamily = f }
+      if let v = dict["labelFontSize"] as? NSNumber, v.doubleValue > 0 { self.labelFontSize = CGFloat(v.doubleValue) }
+      if let v = dict["labelFontWeight"] as? NSNumber { self.labelFontWeight = v.intValue }
+      if let f = dict["itemLabelFontFamily"] as? String, !f.isEmpty { itemFontFamily = f }
+      if let v = dict["labelColor"] as? NSNumber { self.labelColor = Self.colorFromARGB(v.intValue) }
+      if let v = dict["labelColorLight"] as? NSNumber { self.labelColorLight = Self.colorFromARGB(v.intValue) }
+      if let v = dict["labelColorDark"] as? NSNumber { self.labelColorDark = Self.colorFromARGB(v.intValue) }
+      if let v = dict["keepsSourceVisible"] as? NSNumber { self.button.keepsSourceVisible = v.boolValue }
+      if let label = dict["semanticLabel"] as? String, !label.isEmpty {
+        semanticLabel = label
+      }
+      if let data = dict["buttonCustomIconBytes"] as? FlutterStandardTypedData {
+        buttonCustomIconBytes = data.data
+      }
+      if let ap = dict["buttonAssetPath"] as? String { btnAssetPath = ap }
+      if let data = dict["buttonImageData"] as? FlutterStandardTypedData {
+        btnImageData = data.data
+      }
+      if let f = dict["buttonImageFormat"] as? String { btnImageFormat = f }
+      if let s = dict["buttonIconName"] as? String { iconName = s }
+      if let s = dict["buttonIconSize"] as? NSNumber { iconSize = CGFloat(truncating: s) }
+      if let c = dict["buttonIconColor"] as? NSNumber { iconColor = Self.colorFromARGB(c.intValue) }
+      if let r = dict["round"] as? NSNumber { makeRound = r.boolValue }
+      if let v = dict["isDark"] as? NSNumber { isDark = v.boolValue }
+      if let style = dict["style"] as? [String: Any], let n = style["tint"] as? NSNumber { tint = Self.colorFromARGB(n.intValue) }
+      if let bs = dict["buttonStyle"] as? String { buttonStyle = bs }
+      labels = (dict["labels"] as? [String]) ?? []
+      symbols = (dict["sfSymbols"] as? [String]) ?? []
+      if let bytesArray = dict["customIconBytes"] as? [FlutterStandardTypedData?] {
+        customIconBytes = bytesArray.map { $0?.data }
+      }
+      customIconColors = (dict["customIconColors"] as? [Any]) ?? []
+      imageAssetPaths = (dict["imageAssetPaths"] as? [String]) ?? []
+      if let bytesArray = dict["imageAssetData"] as? [FlutterStandardTypedData?] {
+        imageAssetData = bytesArray.map { $0?.data }
+      }
+      imageAssetFormats = (dict["imageAssetFormats"] as? [String]) ?? []
+      dividers = (dict["isDivider"] as? [NSNumber]) ?? []
+      enabled = (dict["enabled"] as? [NSNumber]) ?? []
+      if let c = dict["checked"] as? [NSNumber] { self.checked = c.map { $0.boolValue } }
+      if let d = dict["isDestructive"] as? [NSNumber] { self.isDestructive = d.map { $0.boolValue } }
+      sizes = (dict["sfSymbolSizes"] as? [Any]) ?? []
+      colors = (dict["sfSymbolColors"] as? [Any]) ?? []
+      if let modes = dict["sfSymbolRenderingModes"] as? [String?] { self.itemModes = modes }
+      if let palettes = dict["sfSymbolPaletteColors"] as? [[NSNumber]] { self.itemPalettes = palettes }
+      if let gradients = dict["sfSymbolGradientEnabled"] as? [NSNumber?] { self.itemGradients = gradients }
+      if let m = dict["buttonIconRenderingMode"] as? String { buttonIconMode = m }
+      if let pal = dict["buttonIconPaletteColors"] as? [NSNumber] { buttonIconPalette = pal }
+      self.subtitles = (dict["subtitles"] as? [String]) ?? []
+      self.isSubmenu = ((dict["isSubmenu"] as? [NSNumber]) ?? []).map { $0.boolValue }
+      self.submenus = Self.parseSubmenus(dict["submenus"])
+      let layout = PopupMenuLevel(dict: dict)
+      self.keepsMenuPresented = layout.keepsMenuPresented
+      self.submenuStyles = layout.submenuStyles
+      self.elementSizes = layout.elementSizes
+      self.checkedImages = layout.checkedImages
+      if let preserve = dict["preserveTopToBottomOrder"] as? NSNumber {
+        self.preserveTopToBottomOrder = preserve.boolValue
+      }
+    }
+
+    super.init()
+
+    // `onOpened` / `onClosed` (#141).
+    button.onMenuWillShow = { [weak self] in self?.channel.invokeMethod("menuOpened", arguments: nil) }
+    button.onMenuDidHide = { [weak self] in self?.channel.invokeMethod("menuClosed", arguments: nil) }
+
+    container.backgroundColor = .clear
+    // Flutter's text direction (#167): the button, and the menu it opens.
+    CNLayoutDirection.apply(CNLayoutDirection.read(args as? [String: Any]), to: container)
+    // The button too (#179): taking the direction only from the container,
+    // a configuration button laid out right to left with an image and
+    // content insets below the style's put extra space between the image
+    // and the title that its measured size didn't have, so the title wrapped.
+    CNLayoutDirection.apply(CNLayoutDirection.read(args as? [String: Any]), to: button)
+    button.menuRtl = CNLayoutDirection.read(args as? [String: Any])
+    button.menuItemFontFamily = itemFontFamily
+    container.onLayout = { [weak self] in self?.runDueWidthActions() }
+    // Not measured yet: shown by `reveal` once Flutter has given the view
+    // the measured width, so the first frame isn't at a placeholder width
+    // with the title wrapped (#147).
+    if hiddenUntilSized { button.alpha = 0 }
+    if #available(iOS 13.0, *) { container.overrideUserInterfaceStyle = isDark ? .dark : .light }
+
+    button.translatesAutoresizingMaskIntoConstraints = false
+    // Choose a visible default tint if none provided
+    if let t = tint { button.tintColor = t }
+    else if #available(iOS 13.0, *) { button.tintColor = .label }
+
+    // Add button and pin to container
+    container.addSubview(button)
+    NSLayoutConstraint.activate([
+      button.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+      button.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+      button.topAnchor.constraint(equalTo: container.topAnchor),
+      button.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+    ])
+
+    // Store
+    self.labels = labels
+    self.symbols = symbols
+    self.customIconBytes = customIconBytes
+    self.customIconColors = customIconColors
+    self.dividers = dividers.map { $0.boolValue }
+    self.enabled = enabled.map { $0.boolValue }
+    self.iconScale = iconScale
+
+    self.isRoundButton = makeRound
+    applyButtonStyle(buttonStyle: buttonStyle, round: makeRound)
+    currentButtonStyle = buttonStyle
+    // Now set content (title/image) using configuration when available
+    // Cache current icon props for state updates
+    self.btnIconName = iconName
+    self.btnCustomIconBytes = buttonCustomIconBytes
+    self.btnIconSize = iconSize
+    self.btnIconColor = iconColor
+    self.btnIconMode = buttonIconMode
+    if !buttonIconPalette.isEmpty { self.btnIconPalette = buttonIconPalette.map { Self.colorFromARGB($0.intValue) } }
+    // Apply content initially
+    currentTitle = title
+    requestedTitle = title
+    setButtonContent(title: title, image: makeButtonIconImage(), iconOnly: (title == nil))
+    if #available(iOS 15.0, *), var cfg = button.configuration {
+      // Prefer explicit icon mode/color if provided
+      if let symCfg = makeButtonSymbolConfiguration() {
+        cfg.preferredSymbolConfigurationForImage = symCfg
+      } else if let t = tint, btnIconColor == nil, btnIconMode == nil {
+        // Fallback: color the symbol using current button tint if no explicit color/mode
+        cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(hierarchicalColor: t)
+      }
+      button.configuration = cfg
+    }
+
+    // Ensure the image persists across configuration state changes (highlight/menu)
+    if #available(iOS 15.0, *) {
+      button.configurationUpdateHandler = { [weak self] btn in
+        guard let self = self else { return }
+        var cfg = btn.configuration ?? .plain()
+        // Preserve existing title; just re-apply image
+        cfg.image = self.makeButtonIconImage()
+        cfg.preferredSymbolConfigurationForImage = self.makeButtonSymbolConfiguration()
+        self.applyContentOptions(to: &cfg)
+        btn.configuration = cfg
+      }
+    }
+
+    self.itemSizes = sizes
+    self.itemColors = colors
+    rebuildMenu()
+    if #available(iOS 14.0, *) {
+      button.showsMenuAsPrimaryAction = true
+    } else {
+      button.addTarget(self, action: #selector(onButtonPressedLegacy(_:)), for: .touchUpInside)
+    }
+
+    // Observe transition state changes to swap glass style during navigation
+    if #available(iOS 13.0, *) {
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(handleTransitionStateChange(_:)),
+        name: CNTransitionObserver.transitionStateChangedNotification,
+        object: nil
+      )
+    }
+
+    // What VoiceOver reads (`CNPopupMenuButton.semanticLabel`); nil keeps the
+    // title, or the SF Symbol's own name for an icon-only button.
+    button.accessibilityLabel = semanticLabel
+
+    channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { result(nil); return }
+      switch call.method {
+      case "setSemanticLabel":
+        let label = (call.arguments as? [String: Any])?["label"] as? String
+        self.button.accessibilityLabel = (label?.isEmpty ?? true) ? nil : label
+        result(nil)
+      case "setLayoutDirection":
+        let rtl = CNLayoutDirection.read(call.arguments as? [String: Any])
+        CNLayoutDirection.apply(rtl, to: self.container)
+        CNLayoutDirection.apply(rtl, to: self.button)
+        if rtl != nil { self.button.menuRtl = rtl }
+        result(nil)
+      case "setTransitioning":
+        // Issue #29 follow-up: apply halo-containment clipping only while
+        // the enclosing route is animating OR while a modal/sheet/popup
+        // is presented on top. At rest the container is unclipped so the
+        // glass capsule renders its full soft-edge glow.
+        let active = ((call.arguments as? [String: Any])?["active"] as? NSNumber)?.boolValue ?? false
+        self.applyTransitionContainment(active)
+        CNHaloMask.apply(self.container, arguments: call.arguments)
+        result(nil)
+      case "getIntrinsicSize":
+        // A title still waiting for its width is measured, not the one
+        // shown: measured right after a title change, the old title's width
+        // was taken for the new one (#166).
+        if let pending = self.requestedTitle, pending != self.currentTitle {
+          let size = self.measuredSize(title: pending)
+          result(["width": Double(ceil(size.width)), "height": Double(ceil(size.height))])
+          return
+        }
+        // At an unlimited width: `intrinsicContentSize` wraps a
+        // configuration button's title to the width it has now, so a longer
+        // title set in place came back narrower each time and wrapped (#147).
+        // On a copy, like a pending title: the button itself keeps the title
+        // wrapped to the width it was made at, and in a view about one line
+        // tall it reported that wrapped size, so it stayed too narrow and the
+        // title stayed on two lines, clipped (#179).
+        let size = self.measuredSize(title: self.currentTitle)
+        result(["width": Double(ceil(size.width)), "height": Double(ceil(size.height))])
+      case "measureTitle":
+        // The size the button would take with this title, without showing
+        // it, so Flutter can lay out the new width first (#147).
+        let t = (call.arguments as? [String: Any])?["title"] as? String
+        let size = self.measuredSize(title: t)
+        result(["width": Double(ceil(size.width)), "height": Double(ceil(size.height))])
+      case "reveal":
+        let width = ((call.arguments as? [String: Any])?["atWidth"] as? NSNumber).map { CGFloat(truncating: $0) }
+        self.whenWidth(width) { [weak self] in
+          self?.button.alpha = 1
+          result(nil)
+        }
+      case "setItems":
+        if let args = call.arguments as? [String: Any] {
+          self.labels = (args["labels"] as? [String]) ?? []
+          self.symbols = (args["sfSymbols"] as? [String]) ?? []
+          self.dividers = ((args["isDivider"] as? [NSNumber]) ?? []).map { $0.boolValue }
+          self.enabled = ((args["enabled"] as? [NSNumber]) ?? []).map { $0.boolValue }
+          self.checked = ((args["checked"] as? [NSNumber]) ?? []).map { $0.boolValue }
+          self.isDestructive = ((args["isDestructive"] as? [NSNumber]) ?? []).map { $0.boolValue }
+          let sizes = (args["sfSymbolSizes"] as? [NSNumber]) ?? []
+          let colors = (args["sfSymbolColors"] as? [NSNumber]) ?? []
+          self.itemSizes = sizes
+          self.itemColors = colors
+          self.itemModes = (args["sfSymbolRenderingModes"] as? [String?]) ?? []
+          self.itemPalettes = (args["sfSymbolPaletteColors"] as? [[NSNumber]]) ?? []
+          self.itemGradients = (args["sfSymbolGradientEnabled"] as? [NSNumber?]) ?? []
+          // Handle imageAsset properties
+          self.imageAssetPaths = (args["imageAssetPaths"] as? [String]) ?? []
+          if let bytesArray = args["imageAssetData"] as? [FlutterStandardTypedData?] {
+            self.imageAssetData = bytesArray.map { $0?.data }
+          }
+          self.imageAssetFormats = (args["imageAssetFormats"] as? [String]) ?? []
+          self.subtitles = (args["subtitles"] as? [String]) ?? []
+          self.isSubmenu = ((args["isSubmenu"] as? [NSNumber]) ?? []).map { $0.boolValue }
+          self.submenus = Self.parseSubmenus(args["submenus"])
+          self.readLayout(args)
+          self.rebuildMenu()
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing items", details: nil)) }
+      case "setStyle":
+        if let args = call.arguments as? [String: Any] {
+          if let n = args["tint"] as? NSNumber {
+            self.button.tintColor = Self.colorFromARGB(n.intValue)
+            self.applyButtonStyle(buttonStyle: self.currentButtonStyle, round: self.isRoundButton)
+            // If no explicit icon color/mode is set, color the symbol with tint
+            if #available(iOS 15.0, *), self.btnIconColor == nil, self.btnIconMode == nil, let tint = self.button.tintColor, var cfg = self.button.configuration {
+              cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(hierarchicalColor: tint)
+              self.button.configuration = cfg
+            }
+          }
+          if let bs = args["buttonStyle"] as? String {
+            self.currentButtonStyle = bs
+            self.applyButtonStyle(buttonStyle: bs, round: self.isRoundButton)
+          }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing style", details: nil)) }
+      case "setButtonIcon":
+        if let args = call.arguments as? [String: Any] {
+          // Update cached props
+          if let name = args["buttonIconName"] as? String { self.btnIconName = name }
+          if let s = args["buttonIconSize"] as? NSNumber { self.btnIconSize = CGFloat(truncating: s) }
+          if let c = args["buttonIconColor"] as? NSNumber { self.btnIconColor = Self.colorFromARGB(c.intValue) }
+          if let m = args["buttonIconRenderingMode"] as? String { self.btnIconMode = m }
+          if let pal = args["buttonIconPaletteColors"] as? [NSNumber] { self.btnIconPalette = pal.map { Self.colorFromARGB($0.intValue) } }
+          self.setButtonContent(title: self.currentTitle, image: self.makeButtonIconImage(),
+                                iconOnly: self.currentTitle == nil)
+          if #available(iOS 15.0, *), var cfg = self.button.configuration {
+            if let symCfg = self.makeButtonSymbolConfiguration() {
+              cfg.preferredSymbolConfigurationForImage = symCfg
+            } else if self.btnIconColor == nil, self.btnIconMode == nil, let tint = self.button.tintColor {
+              cfg.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(hierarchicalColor: tint)
+            }
+            self.button.configuration = cfg
+          }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing icon args", details: nil)) }
+      case "setBrightness":
+        if let args = call.arguments as? [String: Any], let isDark = (args["isDark"] as? NSNumber)?.boolValue {
+          if #available(iOS 13.0, *) { self.container.overrideUserInterfaceStyle = isDark ? .dark : .light }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing isDark", details: nil)) }
+      case "setButtonTitle":
+        if let args = call.arguments as? [String: Any], let t = args["title"] as? String {
+          // With `atWidth`, in the layout pass that gives the view that
+          // width: set before it, the title was drawn for a frame at the
+          // old width and wrapped (#147).
+          let width = (args["atWidth"] as? NSNumber).map { CGFloat(truncating: $0) }
+          self.requestedTitle = t
+          self.whenWidth(width) { [weak self] in
+            guard let self = self else { result(nil); return }
+            self.currentTitle = t
+            self.setButtonContent(title: t, image: self.makeButtonIconImage(), iconOnly: false)
+            self.button.layoutIfNeeded()
+            result(nil)
+          }
+        } else { result(FlutterError(code: "bad_args", message: "Missing title", details: nil)) }
+      case "setPressed":
+        if let args = call.arguments as? [String: Any], let p = args["pressed"] as? NSNumber {
+          self.button.isHighlighted = p.boolValue
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing pressed", details: nil)) }
+      case "setInteractive":
+        if let args = call.arguments as? [String: Any],
+           let interactive = (args["interactive"] as? NSNumber)?.boolValue {
+          NSLog("[CN CNPopup] setInteractive=\(interactive)")
+          self._cnSetInteractiveRecursive(self.container, interactive)
+          self._cnSetInteractiveRecursive(self.button, interactive)
+        }
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+  }
+
+  func view() -> UIView { container }
+
+  /// The button's size with `title`, measured on a copy of its
+  /// configuration.
+  private func measuredSize(title: String?) -> CGSize {
+    let unlimited = CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+    guard #available(iOS 15.0, *), var cfg = button.configuration else {
+      return button.sizeThatFits(unlimited)
+    }
+    cfg.title = title
+    let probe = UIButton(configuration: cfg)
+    probe.tintColor = button.tintColor
+    // Measured in the button's direction, like the button lays it out (#179).
+    CNLayoutDirection.apply(button.menuRtl, to: probe)
+    return probe.sizeThatFits(unlimited)
+  }
+
+  /// Runs `action` once the view is `width` wide: now if it is (or `width`
+  /// is nil), otherwise in the layout pass that resizes it, so the change
+  /// and the new width reach the screen in the same frame. Runs anyway
+  /// after 0.3 s, in case that width never comes.
+  private func whenWidth(_ width: CGFloat?, _ action: @escaping () -> Void) {
+    // Tight: a frame even a fraction of a point narrower than the title
+    // needs wraps it.
+    guard let width = width, abs(container.bounds.width - width) > 0.05 else {
+      action()
+      return
+    }
+    nextWidthActionId += 1
+    let id = nextWidthActionId
+    widthActions.append((id: id, width: width, run: action))
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+      guard let self = self, let index = self.widthActions.firstIndex(where: { $0.id == id }) else { return }
+      self.runWidthActions(through: index)
+    }
+  }
+
+  /// Runs the held actions up to the newest one the current width is due
+  /// for, in order (an older title is set before a newer one replaces it).
+  private func runDueWidthActions() {
+    let width = container.bounds.width
+    guard let index = widthActions.lastIndex(where: { abs($0.width - width) <= 0.05 }) else { return }
+    runWidthActions(through: index)
+  }
+
+  private func runWidthActions(through index: Int) {
+    let due = widthActions[0...index]
+    widthActions.removeFirst(index + 1)
+    for entry in due { entry.run() }
+  }
+
+  private func _cnSetInteractiveRecursive(_ view: UIView?, _ interactive: Bool) {
+    guard let view = view else { return }
+    view.isUserInteractionEnabled = interactive
+    for sub in view.subviews { _cnSetInteractiveRecursive(sub, interactive) }
+  }
+
+  /// Toggle Issue #29 halo containment based on whether the enclosing
+  /// route is animating or a modal is presented on top.
+  private func applyTransitionContainment(_ active: Bool) {
+    if active {
+      container.isOpaque = false
+      container.clipsToBounds = true
+      container.layer.backgroundColor = UIColor.clear.cgColor
+      container.layer.shadowOpacity = 0
+      button.clipsToBounds = true
+      button.layer.shadowOpacity = 0
+      button.layer.backgroundColor = UIColor.clear.cgColor
+      button.backgroundColor = .clear
+    } else {
+      container.clipsToBounds = false
+      button.clipsToBounds = false
+    }
+  }
+
+  /// The top level of the menu, from the arrays Flutter sent at creation or
+  /// in the last `setItems`.
+  private var rootLevel: PopupMenuLevel {
+    var level = PopupMenuLevel()
+    level.labels = labels
+    level.symbols = symbols
+    level.customIconBytes = customIconBytes
+    level.customIconColors = customIconColors
+    level.imageAssetPaths = imageAssetPaths
+    level.imageAssetData = imageAssetData
+    level.imageAssetFormats = imageAssetFormats
+    level.dividers = dividers
+    level.enabled = enabled
+    level.checked = checked
+    level.checkedImages = checkedImages
+    level.isDestructive = isDestructive
+    level.sizes = itemSizes
+    level.colors = itemColors
+    level.modes = itemModes
+    level.palettes = itemPalettes
+    level.subtitles = subtitles
+    level.isSubmenu = isSubmenu
+    level.submenus = submenus
+    level.keepsMenuPresented = keepsMenuPresented
+    level.submenuStyles = submenuStyles
+    level.elementSizes = elementSizes
+    return level
+  }
+
+  private func readLayout(_ dict: [String: Any]) {
+    let level = PopupMenuLevel(dict: dict)
+    keepsMenuPresented = level.keepsMenuPresented
+    submenuStyles = level.submenuStyles
+    elementSizes = level.elementSizes
+    checkedImages = level.checkedImages
+  }
+
+  private static func parseSubmenus(_ value: Any?) -> [[String: Any]?] {
+    return ((value as? [Any]) ?? []).map { $0 as? [String: Any] }
+  }
+
+  private func rebuildMenu() {
+    // iOS 14+ native menu
+    if #available(iOS 14.0, *) {
+      // If preserveTopToBottomOrder is enabled, use deferred menu to check position at display time
+      if preserveTopToBottomOrder {
+        // iOS 16+ keeps the given order itself, whichever way the menu
+        // opens, submenus included. The reversal below only reaches the
+        // top level, so a submenu opened upward showed its items reversed.
+        if #available(iOS 16.0, *) {
+          button.preferredMenuElementOrder = .fixed
+          button.menu = UIMenu(title: "", children: buildMenuItems(level: rootLevel))
+          return
+        }
+        let deferredElement = UIDeferredMenuElement.uncached { [weak self] completion in
+          guard let self = self else { completion([]); return }
+          let items = self.buildMenuItems(level: self.rootLevel)
+
+          // Check button position at display time
+          let buttonFrame = self.button.convert(self.button.bounds, to: nil)
+          let screenHeight = UIScreen.main.bounds.height
+          let opensUpward = buttonFrame.midY > screenHeight * 0.4
+
+          if opensUpward {
+            // Reverse groups AND items within each group
+            let reversed: [UIMenuElement] = items.reversed().map { element in
+              if let menu = element as? UIMenu {
+                return UIMenu(title: menu.title, options: menu.options, children: menu.children.reversed())
+              }
+              return element
+            }
+            completion(reversed)
+          } else {
+            completion(items)
+          }
+        }
+        button.menu = UIMenu(title: "", children: [deferredElement])
+        return
+      }
+
+      // Standard menu building (native behavior)
+      let items = buildMenuItems(level: rootLevel)
+      button.menu = UIMenu(title: "", children: items)
+    }
+  }
+
+  private func buildMenuItems(level: PopupMenuLevel) -> [UIMenuElement] {
+    PopupMenuBuilder.elements(level: level, iconScale: iconScale) { [weak self] path in
+      // `index` is the top-level entry, as before; `path` the full path.
+      self?.channel.invokeMethod("itemSelected", arguments: ["index": path[0], "path": path])
+    }
+  }
+
+  @objc private func onButtonPressedLegacy(_ sender: UIButton) {
+    // iOS 13 fallback: use action sheet
+    let ac = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
+    let count = max(labels.count, max(symbols.count, dividers.count))
+    for i in 0..<count {
+      if i < dividers.count, dividers[i] {
+        // Simulate separator with disabled action
+        let fake = UIAlertAction(title: "—", style: .default, handler: nil)
+        fake.isEnabled = false
+        ac.addAction(fake)
+        continue
+      }
+      let title = i < labels.count ? labels[i] : ""
+      let destructive = i < self.isDestructive.count ? self.isDestructive[i] : false
+      let action = UIAlertAction(title: title, style: destructive ? .destructive : .default) { [weak self] _ in
+        self?.channel.invokeMethod("itemSelected", arguments: ["index": i])
+      }
+      if i < enabled.count { action.isEnabled = enabled[i] }
+      // Optional: set image where supported (iOS 13 has `image` on UIAlertAction)
+      var img: UIImage? = nil
+      if i < customIconBytes.count, let data = customIconBytes[i] {
+        img = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+        // Apply tint color to custom icon if provided
+        if i < self.customIconColors.count,
+           let colorNum = self.customIconColors[i] as? NSNumber,
+           !(self.customIconColors[i] is NSNull) {
+          let tintColor = Self.colorFromARGB(colorNum.intValue)
+          img = img?.withTintColor(tintColor, renderingMode: .alwaysOriginal)
+        }
+      } else if i < symbols.count, !symbols[i].isEmpty {
+        img = UIImage(systemName: symbols[i])
+      }
+      if let img = img {
+        if #available(iOS 13.0, *) { action.setValue(img, forKey: "image") }
+      }
+      ac.addAction(action)
+    }
+    ac.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+
+    if let pop = ac.popoverPresentationController {
+      pop.sourceView = sender
+      pop.sourceRect = sender.bounds
+    }
+    parentViewController(for: container)?.present(ac, animated: true, completion: nil)
+  }
+
+  private func parentViewController(for view: UIView) -> UIViewController? {
+    var responder: UIResponder? = view
+    while let r = responder {
+      if let vc = r as? UIViewController { return vc }
+      responder = r.next
+    }
+    return nil
+  }
+
+  // Use shared utility functions
+  private static func colorFromARGB(_ argb: Int) -> UIColor {
+    return ImageUtils.colorFromARGB(argb)
+  }
+
+  @available(iOS 13.0, *)
+  private func makeButtonIconImage() -> UIImage? {
+    // Priority: imageAsset > customIconBytes > SF Symbol
+    
+    // Handle imageAsset (highest priority)
+    if let path = btnAssetPath, !path.isEmpty {
+      let iconColorARGB = btnIconColor != nil ? ImageUtils.colorToARGB(btnIconColor!) : nil
+      let size = CGSize(width: btnIconSize ?? 20, height: btnIconSize ?? 20)
+      
+      // Use utility function to load and optionally tint image
+      if let argb = iconColorARGB, #available(iOS 13.0, *) {
+        return ImageUtils.loadAndTintImage(
+          from: path,
+          iconSize: btnIconSize,
+          iconColor: argb,
+          providedFormat: btnImageFormat,
+          scale: iconScale
+        )
+      } else {
+        return ImageUtils.loadFlutterAsset(path, size: size, format: btnImageFormat, scale: iconScale)
+      }
+    } else if let data = btnImageData {
+      let iconColorARGB = btnIconColor != nil ? ImageUtils.colorToARGB(btnIconColor!) : nil
+      
+      // Use utility function to create and optionally tint image
+      if let argb = iconColorARGB, #available(iOS 13.0, *) {
+        return ImageUtils.createAndTintImage(
+          from: data,
+          iconSize: btnIconSize,
+          iconColor: argb,
+          providedFormat: btnImageFormat,
+          scale: iconScale
+        )
+      } else {
+        let size: CGSize? = btnIconSize != nil ? CGSize(width: btnIconSize!, height: btnIconSize!) : nil
+        return ImageUtils.createImageFromData(data, format: btnImageFormat, size: size, scale: iconScale)
+      }
+    }
+    
+    // Handle custom icon bytes (medium priority)
+    if let data = btnCustomIconBytes {
+      var image = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+      // Apply custom icon color if provided, preserving the tint with .alwaysOriginal
+      if let image = image, let color = btnIconColor {
+        return image.withTintColor(color, renderingMode: .alwaysOriginal)
+      }
+      return image
+    }
+    
+    // Handle SF Symbol (lowest priority)
+    guard let name = btnIconName, var image = UIImage(systemName: name) else { return nil }
+    if let sz = btnIconSize {
+      image = image.applyingSymbolConfiguration(UIImage.SymbolConfiguration(pointSize: sz)) ?? image
+    }
+    if let mode = btnIconMode {
+      switch mode {
+      case "hierarchical":
+        if #available(iOS 15.0, *), let c = btnIconColor {
+          let cfg = UIImage.SymbolConfiguration(hierarchicalColor: c)
+          image = image.applyingSymbolConfiguration(cfg) ?? image
+        }
+      case "palette":
+        if #available(iOS 15.0, *), !btnIconPalette.isEmpty {
+          let cfg = UIImage.SymbolConfiguration(paletteColors: btnIconPalette)
+          image = image.applyingSymbolConfiguration(cfg) ?? image
+        }
+      case "multicolor":
+        if #available(iOS 15.0, *) {
+          let cfg = UIImage.SymbolConfiguration.preferringMulticolor()
+          image = image.applyingSymbolConfiguration(cfg) ?? image
+        }
+      default:
+        break
+      }
+    } else if let col = btnIconColor {
+      if #available(iOS 15.0, *) {
+        let cfg = UIImage.SymbolConfiguration(hierarchicalColor: col)
+        image = image.applyingSymbolConfiguration(cfg) ?? image
+      } else {
+        image = image.withTintColor(col, renderingMode: .alwaysOriginal)
+      }
+    }
+    return image
+  }
+
+  @available(iOS 15.0, *)
+  private func makeButtonSymbolConfiguration() -> UIImage.SymbolConfiguration? {
+    if let mode = btnIconMode {
+      switch mode {
+      case "hierarchical":
+        if let c = btnIconColor { return UIImage.SymbolConfiguration(hierarchicalColor: c) }
+      case "palette":
+        if !btnIconPalette.isEmpty { return UIImage.SymbolConfiguration(paletteColors: btnIconPalette) }
+      case "multicolor":
+        return UIImage.SymbolConfiguration.preferringMulticolor()
+      default:
+        break
+      }
+    } else if let c = btnIconColor {
+      return UIImage.SymbolConfiguration(hierarchicalColor: c)
+    }
+    return nil
+  }
+
+  private func applyButtonStyle(buttonStyle: String, round: Bool) {
+    if #available(iOS 15.0, *) {
+      // Preserve current content while swapping configurations
+      let currentTitle = button.configuration?.title
+      let currentImage = button.configuration?.image
+      let currentSymbolCfg = button.configuration?.preferredSymbolConfigurationForImage
+      var config: UIButton.Configuration
+      switch buttonStyle {
+      case "plain": config = .plain()
+      case "gray": config = .gray()
+      case "tinted": config = .tinted()
+      case "bordered": config = .bordered()
+      case "borderedProminent": config = .borderedProminent()
+      case "filled": config = .filled()
+      case "glass":
+        // Use tinted fallback during transitions to prevent glass sampling artifacts
+        if #available(iOS 26.0, *), !isTransitioning { config = .glass() } else { config = .tinted() }
+      case "prominentGlass":
+        // Use tinted fallback during transitions to prevent glass sampling artifacts
+        if #available(iOS 26.0, *), !isTransitioning { config = .prominentGlass() } else { config = .tinted() }
+      case "clearGlass":
+        if #available(iOS 26.0, *), !isTransitioning { config = .clearGlass() } else { config = .tinted() }
+      case "prominentClearGlass":
+        if #available(iOS 26.0, *), !isTransitioning { config = .prominentClearGlass() } else { config = .tinted() }
+      default:
+        config = .plain()
+      }
+      config.cornerStyle = round ? .capsule : .dynamic
+      if let tint = button.tintColor {
+        switch buttonStyle {
+        case "filled", "borderedProminent", "prominentGlass", "prominentClearGlass":
+          config.baseBackgroundColor = tint
+        case "tinted", "bordered", "gray", "plain", "glass", "clearGlass":
+          config.baseForegroundColor = tint
+        default:
+          break
+        }
+      }
+      // Restore content after style swap
+      config.title = currentTitle
+      config.image = currentImage
+      config.preferredSymbolConfigurationForImage = currentSymbolCfg
+      applyContentOptions(to: &config)
+      button.configuration = config
+    } else {
+      button.layer.cornerRadius = round ? 999 : 8
+      button.clipsToBounds = true
+      if buttonStyle == "glass" {
+        button.backgroundColor = UIColor(white: 1.0, alpha: 0.22)
+        button.layer.borderColor = UIColor.separator.withAlphaComponent(0.45).cgColor
+        button.layer.borderWidth = 1.0 / UIScreen.main.scale
+      } else {
+        button.backgroundColor = .clear
+        button.layer.borderWidth = 0
+      }
+    }
+  }
+
+  /// The image placement and padding, and the label's font and colour
+  /// (#141), which every configuration the button gets carries.
+  @available(iOS 15.0, *)
+  private func applyContentOptions(to cfg: inout UIButton.Configuration) {
+    cfg.imagePlacement = imagePlacement
+    if let padding = imagePadding { cfg.imagePadding = padding }
+    if let insets = contentInsets { cfg.contentInsets = insets }
+    guard labelFontFamily != nil || labelFontSize != nil || labelFontWeight != nil || labelColor != nil ||
+      labelColorLight != nil || labelColorDark != nil else { return }
+    let family = labelFontFamily, size = labelFontSize, color = labelColor
+    let light = labelColorLight, dark = labelColorDark
+    let weight = CNFontResolver.weight(fromFlutterValue: labelFontWeight)
+    cfg.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+      var outgoing = incoming
+      let base = incoming.font ?? UIFont.preferredFont(forTextStyle: .body)
+      let pointSize = size ?? base.pointSize
+      if let family, let font = CNFontResolver.font(family: family, size: pointSize, weight: weight) {
+        outgoing.font = font
+      } else if let weight {
+        outgoing.font = UIFont.systemFont(ofSize: pointSize, weight: weight)
+      } else {
+        outgoing.font = base.withSize(pointSize)
+      }
+      if light != nil || dark != nil {
+        // Liquid Glass gives its content the appearance that suits what is
+        // behind it, so each side follows the glass (#153).
+        let fallback = color ?? incoming.foregroundColor ?? .label
+        outgoing.foregroundColor = UIColor { traits in
+          let side = traits.userInterfaceStyle == .dark ? dark : light
+          return side ?? fallback.resolvedColor(with: traits)
+        }
+      } else if let color { outgoing.foregroundColor = color }
+      return outgoing
+    }
+  }
+
+  private func setButtonContent(title: String?, image: UIImage?, iconOnly: Bool) {
+    if #available(iOS 15.0, *) {
+      var cfg = button.configuration ?? .plain()
+      cfg.title = title
+      cfg.image = image
+      applyContentOptions(to: &cfg)
+      button.configuration = cfg
+    } else {
+      button.setTitle(title, for: .normal)
+      button.setImage(image, for: .normal)
+      if iconOnly {
+        button.contentEdgeInsets = UIEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
+      }
+    }
+  }
+
+  private static func loadFlutterAsset(_ assetPath: String) -> UIImage? {
+    return ImageUtils.loadFlutterAsset(assetPath)
+  }
+
+  private static func createImageFromData(_ data: Data, format: String?, scale: CGFloat) -> UIImage? {
+    return ImageUtils.createImageFromData(data, format: format, scale: scale)
+  }
+
+  deinit {
+    if #available(iOS 13.0, *) {
+      NotificationCenter.default.removeObserver(self)
+    }
+  }
+
+  @objc private func handleTransitionStateChange(_ notification: Notification) {
+    guard let userInfo = notification.userInfo,
+          let transitioning = userInfo["isTransitioning"] as? Bool else { return }
+
+    self.isTransitioning = transitioning
+
+    // Only swap styles if using glass style on iOS 26+
+    if #available(iOS 26.0, *) {
+      if ["glass", "prominentGlass", "clearGlass", "prominentClearGlass"].contains(currentButtonStyle) {
+        DispatchQueue.main.async {
+          self.applyButtonStyle(buttonStyle: self.currentButtonStyle, round: self.isRoundButton)
+        }
+      }
+    }
+  }
+}
+
+/// The button `CNPopupMenuButton` shows its menu from. It tells when the
+/// menu opens and closes (`onOpened`, `onClosed`), and with
+/// `keepsSourceVisible` UIKit grows the menu out of a clear stand-in at the
+/// button's place instead of out of the button, so the button itself is not
+/// morphed into the menu and back (#141).
+final class CNPopupMenuUIButton: UIButton {
+  var onMenuWillShow: (() -> Void)?
+  var onMenuDidHide: (() -> Void)?
+  var keepsSourceVisible = false
+
+  deinit {
+    directionLink?.invalidate()
+    if let commitObserver { CFRunLoopObserverInvalidate(commitObserver) }
+  }
+  private var standIn: UIView?
+  /// The direction the menu is laid out in, from Flutter (#167); nil keeps
+  /// the system's.
+  var menuRtl: Bool?
+  /// The font family of the menu's item titles (#181); nil keeps the
+  /// system's.
+  var menuItemFontFamily: String?
+  /// The window's views from before the menu opened, so the views the
+  /// system adds for the menu can be told apart.
+  private var viewsBeforeMenu: Set<ObjectIdentifier> = []
+  /// The views the system added for the open menu, and the display link
+  /// that gives views it adds later (a submenu's rows) the direction too.
+  private var menuViews: [UIView] = []
+  private var directionLink: CADisplayLink?
+  /// Gives the menu's views the direction before each frame is drawn while
+  /// the menu is up (#178).
+  private var commitObserver: CFRunLoopObserver?
+
+  override func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    configurationForMenuAtLocation location: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    viewsBeforeMenu = Set((window?.subviews ?? []).map(ObjectIdentifier.init))
+    return super.contextMenuInteraction(interaction, configurationForMenuAtLocation: location)
+  }
+
+  /// The menu's views don't exist yet when it is about to show: UIKit adds
+  /// them right after, in the same turn of the run loop. Found only once the
+  /// open animation had ended, the menu jumped from one direction to the
+  /// other (#178). This observer runs at the end of every turn while the
+  /// menu is up, just before Core Animation commits the frame (its own
+  /// observer, order 2000000), so views added in a turn get the direction,
+  /// and the family, before the frame that first shows them is drawn. No
+  /// state outside the menu is changed.
+  private func startCommitObserver() {
+    guard commitObserver == nil else { return }
+    let activities = CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue
+    let observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault, activities, true, 1_999_000) {
+      [weak self] _, _ in self?.applyMenuDirection()
+    }
+    CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    commitObserver = observer
+  }
+
+  /// Lays the menu out in Flutter's direction (#167). UIKit shows the menu
+  /// in a view of its own on top of the window, which takes the app's
+  /// language, not the button's direction. Its views get the direction:
+  /// the layout direction trait, which views it adds later inherit, and the
+  /// semantic content attribute, which aligns the titles.
+  private func applyMenuDirection() {
+    guard let window else { return }
+    // Already the app's direction: nothing to change.
+    let appRtl = UIApplication.shared.userInterfaceLayoutDirection == .rightToLeft
+    let rtl = menuRtl.flatMap { $0 != appRtl ? $0 : nil }
+    guard rtl != nil || menuItemFontFamily != nil else { return }
+    for view in window.subviews
+    where !viewsBeforeMenu.contains(ObjectIdentifier(view)) && !isDescendant(of: view)
+      && !menuViews.contains(where: { $0 === view }) {
+      if let rtl, #available(iOS 17.0, *) {
+        view.traitOverrides.layoutDirection = rtl ? .rightToLeft : .leftToRight
+      }
+      menuViews.append(view)
+    }
+    if let rtl { for view in menuViews { Self.force(rtl, on: view) } }
+    if let family = menuItemFontFamily {
+      // A menu has no font setting, so its title labels get the family
+      // (#181): only labels showing an item's or a submenu's title, each at
+      // its own size and weight, so the rows keep the system's layout.
+      let titles = Self.titles(of: menu)
+      for view in menuViews { Self.apply(family: family, to: view, titles: titles) }
+    }
+    if directionLink == nil {
+      // Titles take their alignment from the attribute, not the trait, so
+      // rows added after this (a submenu opening) need it as well.
+      let link = CADisplayLink(target: CNMenuDirectionTicker(button: self), selector: #selector(CNMenuDirectionTicker.tick))
+      link.add(to: .main, forMode: .common)
+      directionLink = link
+    }
+  }
+
+  /// Each frame while the menu is up: finds the menu's views as soon as
+  /// UIKit adds them (#178), and gives rows added later the direction.
+  fileprivate func reapplyMenuDirection() { applyMenuDirection() }
+
+  private func endMenuDirection() {
+    directionLink?.invalidate()
+    directionLink = nil
+    if let commitObserver { CFRunLoopObserverInvalidate(commitObserver) }
+    commitObserver = nil
+    menuViews = []
+  }
+
+  private static func titles(of menu: UIMenu?) -> Set<String> {
+    var titles = Set<String>()
+    func walk(_ elements: [UIMenuElement]) {
+      for element in elements {
+        if let action = element as? UIAction {
+          titles.insert(action.title)
+        } else if let submenu = element as? UIMenu {
+          // An inline group's title is a section header, not a row.
+          if !submenu.options.contains(.displayInline) { titles.insert(submenu.title) }
+          walk(submenu.children)
+        }
+      }
+    }
+    walk(menu?.children ?? [])
+    titles.remove("")
+    return titles
+  }
+
+  private static func apply(family: String, to view: UIView, titles: Set<String>) {
+    if let label = view as? UILabel, let text = label.text, titles.contains(text) {
+      let current = label.font ?? UIFont.preferredFont(forTextStyle: .body)
+      let traits = current.fontDescriptor.object(forKey: .traits) as? [UIFontDescriptor.TraitKey: Any]
+      let weight = (traits?[.weight] as? CGFloat).map { UIFont.Weight(rawValue: $0) }
+      if let font = CNFontResolver.font(family: family, size: current.pointSize, weight: weight),
+         font.fontName != current.fontName {
+        label.font = font
+      }
+    }
+    for sub in view.subviews { apply(family: family, to: sub, titles: titles) }
+  }
+
+  private static func force(_ rtl: Bool, on view: UIView) {
+    let attribute: UISemanticContentAttribute = rtl ? .forceRightToLeft : .forceLeftToRight
+    if view.semanticContentAttribute != attribute {
+      view.semanticContentAttribute = attribute
+      view.setNeedsLayout()
+    }
+    for sub in view.subviews { force(rtl, on: sub) }
+  }
+
+  private func standInPreview() -> UITargetedPreview? {
+    guard keepsSourceVisible, let superview, window != nil else { return nil }
+    let stand = standIn ?? {
+      let view = UIView()
+      view.backgroundColor = .clear
+      view.isUserInteractionEnabled = false
+      view.isAccessibilityElement = false
+      superview.insertSubview(view, belowSubview: self)
+      standIn = view
+      return view
+    }()
+    stand.frame = frame
+    let parameters = UIPreviewParameters()
+    parameters.backgroundColor = .clear
+    parameters.visiblePath = UIBezierPath(roundedRect: stand.bounds, cornerRadius: min(bounds.width, bounds.height) / 2)
+    return UITargetedPreview(view: stand, parameters: parameters)
+  }
+
+  override func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    previewForHighlightingMenuWithConfiguration configuration: UIContextMenuConfiguration
+  ) -> UITargetedPreview? {
+    standInPreview() ?? super.contextMenuInteraction(interaction, previewForHighlightingMenuWithConfiguration: configuration)
+  }
+
+  override func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    previewForDismissingMenuWithConfiguration configuration: UIContextMenuConfiguration
+  ) -> UITargetedPreview? {
+    standInPreview() ?? super.contextMenuInteraction(interaction, previewForDismissingMenuWithConfiguration: configuration)
+  }
+
+  override func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    willDisplayMenuFor configuration: UIContextMenuConfiguration,
+    animator: UIContextMenuInteractionAnimating?
+  ) {
+    super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+    applyMenuDirection()
+    startCommitObserver()
+    animator?.addCompletion { [weak self] in self?.applyMenuDirection() }
+    onMenuWillShow?()
+  }
+
+  override func contextMenuInteraction(
+    _ interaction: UIContextMenuInteraction,
+    willEndFor configuration: UIContextMenuConfiguration,
+    animator: UIContextMenuInteractionAnimating?
+  ) {
+    super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+    let done = { [weak self] in
+      self?.standIn?.removeFromSuperview()
+      self?.standIn = nil
+      self?.endMenuDirection()
+      self?.onMenuDidHide?()
+    }
+    if let animator { animator.addCompletion(done) } else { done() }
+  }
+}
+
+/// Calls the button from the display link without the link keeping the
+/// button alive (#167).
+final class CNMenuDirectionTicker: NSObject {
+  weak var button: CNPopupMenuUIButton?
+  init(button: CNPopupMenuUIButton) { self.button = button }
+  @objc func tick() { button?.reapplyMenuDirection() }
+}
+
+/// The popup menu button's container: reports each layout pass, so a change
+/// held for a new width lands in the pass that applies the width (#147).
+final class CNLayoutReportingView: UIView {
+  var onLayout: (() -> Void)?
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    onLayout?()
+  }
+}

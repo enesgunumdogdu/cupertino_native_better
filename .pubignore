@@ -1,0 +1,57 @@
+# Build outputs (package root)
+build/
+.dart_tool/
+
+# Example app build / generated artifacts
+example/build/
+example/.dart_tool/
+example/.flutter-plugins
+example/.flutter-plugins-dependencies
+
+# Example iOS generated files
+example/ios/.symlinks/
+example/ios/Pods/
+example/ios/Flutter/ephemeral/
+example/ios/Flutter/.last_build_id
+example/ios/Flutter/Flutter.podspec
+example/ios/Flutter/Flutter.framework
+example/ios/Flutter/Generated.xcconfig
+example/ios/Flutter/flutter_export_environment.sh
+example/ios/Flutter/app.flx
+example/ios/Flutter/app.zip
+example/ios/Flutter/flutter_assets/
+example/ios/ServiceDefinitions.json
+example/ios/Runner/GeneratedPluginRegistrant.h
+example/ios/Runner/GeneratedPluginRegistrant.m
+
+# Example macOS generated files
+example/macos/Pods/
+example/macos/Flutter/GeneratedPluginRegistrant.swift
+example/macos/Flutter/ephemeral/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS finder
+.DS_Store
+**/.DS_Store
+
+# Generated dart files (none currently, but defensive)
+*.g.dart
+*.freezed.dart
+
+# Test outputs
+coverage/
+
+# Xcode user state
+**/xcuserdata/
+
+# Internal planning / design docs — local only, never published
+docs/
+
+# Repository-only media and dev tooling. The README loads its images from
+# GitHub (raw.githubusercontent.com), so they are not needed in the package.
+misc/
+tool/

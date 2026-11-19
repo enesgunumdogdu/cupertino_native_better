@@ -1,0 +1,133 @@
+name: Issue 184 probe
+
+on:
+  push:
+    branches: [ci/issue-184-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: before fix (v2.10.1)
+            ref: 165381b39fa59585d16f09c5b1bf6b78337a1e6d
+            expect: --expect-bug
+          - name: after fix
+            ref: fix/184-search-bar-safe-area
+            expect: --expect-centred
+    steps:
+      - name: Check out the package under test
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: cupertino_native_better
+          fetch-depth: 0
+
+      - name: Check out the probe
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - run: cp ci/tool/issue184/issue184_probe_entry.dart cupertino_native_better/example/lib/
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.0
+          channel: stable
+          cache: true
+
+      - name: Versions
+        run: |
+          xcodebuild -version
+          flutter --version
+          git -C cupertino_native_better log -1 --oneline
+
+      - name: Analyze and format the probe
+        working-directory: cupertino_native_better/example
+        run: |
+          flutter pub get
+          flutter analyze lib/issue184_probe_entry.dart
+          dart format --output=none --set-exit-if-changed lib/issue184_probe_entry.dart
+
+      - name: Analyze the package
+        working-directory: cupertino_native_better
+        run: |
+          flutter pub get
+          flutter analyze lib
+
+      - name: Build for the simulator
+        working-directory: cupertino_native_better/example
+        run: flutter build ios --simulator --debug -t lib/issue184_probe_entry.dart
+
+      - name: Boot an iPhone 17 Pro on iOS 26
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)["devices"]
+          for runtime in sorted(data, reverse=True):
+              if "iOS-26" not in runtime:
+                  continue
+              for d in data[runtime]:
+                  if d["name"] in ("iPhone 17 Pro", "iPhone 16 Pro"):
+                      print(d["udid"]); sys.exit(0)
+          sys.exit("no iPhone 17 Pro / 16 Pro on iOS 26")')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl list devices booted
+
+      - name: Run the probe and take a screenshot
+        run: |
+          APP=cupertino_native_better/example/build/ios/iphonesimulator/Runner.app
+          BUNDLE=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$BUNDLE"
+          mkdir -p shots
+          for i in 1 2 3; do
+            sleep 20
+            xcrun simctl io "$UDID" screenshot "shots/shot_$i.png"
+          done
+
+      - name: Publish the screenshots to the ci/issue-184-shots branch
+        if: always()
+        working-directory: ci
+        run: |
+          KIND=${{ matrix.expect == '--expect-bug' && 'before' || 'after' }}
+          git config user.name "issue184-probe"
+          git config user.email "issue184-probe@users.noreply.github.com"
+          git fetch -q origin ci/issue-184-shots || true
+          if git rev-parse -q --verify FETCH_HEAD >/dev/null; then
+            git checkout -q -B shots FETCH_HEAD
+          else
+            git checkout -q --orphan shots && git rm -rq . || true
+          fi
+          mkdir -p "$KIND" && rm -f "$KIND"/*.png
+          cp ../shots/*.png "$KIND"/ 2>/dev/null || true
+          git add -A "$KIND" && git commit -qm "shots: $KIND ${{ github.sha }}" || true
+          for i in 1 2 3; do
+            git push -q origin shots:ci/issue-184-shots && break
+            git fetch -q origin ci/issue-184-shots && git rebase -q FETCH_HEAD
+          done
+
+      - name: Measure the field's position in its frame
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q pillow
+          for f in shots/*.png; do
+            echo "== $f"
+            /tmp/venv/bin/python ci/tool/issue184/issue184_measure.py "$f" ${{ matrix.expect }}
+          done
+
+      - name: Upload the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue184-${{ matrix.ref == '165381b39fa59585d16f09c5b1bf6b78337a1e6d' && 'before' || 'after' }}
+          path: shots/

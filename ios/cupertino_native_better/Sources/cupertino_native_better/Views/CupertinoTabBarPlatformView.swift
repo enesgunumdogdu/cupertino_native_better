@@ -1,0 +1,1421 @@
+import Flutter
+import UIKit
+import SVGKit
+
+class CupertinoTabBarPlatformView: NSObject, FlutterPlatformView, UITabBarDelegate {
+  /// A badge of only a zero-width space is a dot. UITabBarItem has no dot badge, and on iOS 26 its badge
+  /// keeps one size whatever its text, so a dot is drawn by [CNDotTabBar] instead and the item carries no
+  /// system badge. Every other value is a normal badge.
+  static let dotBadge = "\u{200B}"
+  private static var dotKey: UInt8 = 0
+
+  static func isDot(_ item: UITabBarItem) -> Bool {
+    (objc_getAssociatedObject(item, &dotKey) as? Bool) == true
+  }
+
+  /// The empty bar iOS 26 leaves on each side of a bar's glass capsule: the capsule is drawn at
+  /// its content's size and centred in the bar. Measured on the iOS 26 simulator; UIKit doesn't
+  /// expose it. A split bar takes it off the gap twice, so `splitSpacing` is the gap between the
+  /// two capsules rather than between two bars around them.
+  static var splitCapsuleMargin: CGFloat {
+    if #available(iOS 26.0, *) { return 22 }
+    return 0
+  }
+
+  /// The narrowest right bar, in a split bar laid out by proportion. Below it, iOS 26 draws a
+  /// single item as a narrow pill with its icon and label shrunk, as with five items on a 402 pt
+  /// wide phone, where the right bar got 1/5 of the width; at 1/4 it is a circle. Two items or
+  /// more already get enough.
+  static var minSplitRightWidth: CGFloat {
+    if #available(iOS 26.0, *) { return 100 }
+    return 0
+  }
+
+  static func applyBadge(_ value: String?, to item: UITabBarItem) {
+    let dot = value == dotBadge
+    objc_setAssociatedObject(item, &dotKey, dot, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    if dot || value == nil || value!.isEmpty {
+      item.badgeValue = nil
+    } else {
+      item.badgeValue = value
+    }
+  }
+
+  private let channel: FlutterMethodChannel
+  private let container: CNTabBarContainer
+  private var tabBar: UITabBar?
+  private var tabBarLeft: UITabBar?
+  private var tabBarRight: UITabBar?
+  
+  // MARK: - State Properties
+  private var isSplit: Bool = false
+  private var rightCountVal: Int = 1
+  private var currentLabels: [String] = []
+  private var currentSymbols: [String] = []
+  private var currentActiveSymbols: [String] = []
+  private var currentBadges: [String] = []
+  private var currentCustomIconBytes: [Data?] = []
+  private var currentActiveCustomIconBytes: [Data?] = []
+  private var currentImageAssetPaths: [String] = []
+  private var currentActiveImageAssetPaths: [String] = []
+  private var currentImageAssetData: [Data?] = []
+  private var currentActiveImageAssetData: [Data?] = []
+  private var currentImageAssetFormats: [String] = []
+  private var currentActiveImageAssetFormats: [String] = []
+  private var iconScale: CGFloat = UIScreen.main.scale
+  private var leftInsetVal: CGFloat = 0
+  private var rightInsetVal: CGFloat = 0
+  private var splitSpacingVal: CGFloat = 12 // Apple's recommended spacing for visual separation
+  private var currentIconSizes: [CGFloat] = [] // Track icon sizes for dynamic height calculation
+  private var labelFontFamily: String? = nil
+  private var labelFontSize: CGFloat = 0 // 0 means system default (~10pt)
+  /// `CNTabBar.labelFontWeight` / `selectedLabelFontWeight` (Flutter's
+  /// `FontWeight.value`); nil keeps the system's medium and semibold (#142).
+  private var labelFontWeight: Int? = nil
+  private var selectedLabelFontWeight: Int? = nil
+  /// The menu each item opens instead of selecting itself (null for a plain
+  /// item), encoded by `encodePopupMenuEntries`.
+  private var currentMenus: [[String: Any]?] = []
+  /// `CNTabBarItem.semanticLabel` per item ("" for none): the name VoiceOver
+  /// reads, which an icon-only tab has no other way to get (#132).
+  private var currentSemanticLabels: [String] = []
+  /// The indices of the items that run an action instead of being selected
+  /// (`CNTabBarItem.onPressed`, #131).
+  private var currentActions: Set<Int> = []
+  /// The selected item, so a tap on an item with a menu can put it back.
+  private var currentIndex: Int = 0
+
+  init(frame: CGRect, viewId: Int64, args: Any?, messenger: FlutterBinaryMessenger) {
+    self.channel = FlutterMethodChannel(name: "CupertinoNativeTabBar_\(viewId)", binaryMessenger: messenger)
+    self.container = CNTabBarContainer(frame: frame)
+
+    var labels: [String] = []
+    var symbols: [String] = []
+    var activeSymbols: [String] = []
+    var badges: [String] = []
+    var customIconBytes: [Data?] = []
+    var activeCustomIconBytes: [Data?] = []
+    var imageAssetPaths: [String] = []
+    var activeImageAssetPaths: [String] = []
+    var imageAssetData: [Data?] = []
+    var activeImageAssetData: [Data?] = []
+    var imageAssetFormats: [String] = []
+    var activeImageAssetFormats: [String] = []
+    var iconScale: CGFloat = UIScreen.main.scale
+    var sizes: [NSNumber?] = []
+    var colors: [NSNumber] = [] // ignored; use tintColor
+    var selectedIndex: Int = 0
+    var isDark: Bool = false
+    var tint: UIColor? = nil
+    var bg: UIColor? = nil
+    var split: Bool = false
+    var rightCount: Int = 1
+    var leftInset: CGFloat = 0
+    var rightInset: CGFloat = 0
+
+    if let dict = args as? [String: Any] {
+      labels = (dict["labels"] as? [String]) ?? []
+      symbols = (dict["sfSymbols"] as? [String]) ?? []
+      activeSymbols = (dict["activeSfSymbols"] as? [String]) ?? []
+      badges = (dict["badges"] as? [String]) ?? []
+      if let bytesArray = dict["customIconBytes"] as? [FlutterStandardTypedData?] {
+        customIconBytes = bytesArray.map { $0?.data }
+      }
+      if let bytesArray = dict["activeCustomIconBytes"] as? [FlutterStandardTypedData?] {
+        activeCustomIconBytes = bytesArray.map { $0?.data }
+      }
+      imageAssetPaths = (dict["imageAssetPaths"] as? [String]) ?? []
+      activeImageAssetPaths = (dict["activeImageAssetPaths"] as? [String]) ?? []
+      if let bytesArray = dict["imageAssetData"] as? [FlutterStandardTypedData?] {
+        imageAssetData = bytesArray.map { $0?.data }
+      }
+      if let bytesArray = dict["activeImageAssetData"] as? [FlutterStandardTypedData?] {
+        activeImageAssetData = bytesArray.map { $0?.data }
+      }
+      imageAssetFormats = (dict["imageAssetFormats"] as? [String]) ?? []
+      activeImageAssetFormats = (dict["activeImageAssetFormats"] as? [String]) ?? []
+      if let scale = dict["iconScale"] as? NSNumber {
+        iconScale = CGFloat(truncating: scale)
+      }
+      sizes = (dict["sfSymbolSizes"] as? [NSNumber?]) ?? []
+      colors = (dict["sfSymbolColors"] as? [NSNumber]) ?? []
+      if let v = dict["selectedIndex"] as? NSNumber { selectedIndex = v.intValue }
+      if let v = dict["isDark"] as? NSNumber { isDark = v.boolValue }
+      if let style = dict["style"] as? [String: Any] {
+        if let n = style["tint"] as? NSNumber { tint = Self.colorFromARGB(n.intValue) }
+        if let n = style["backgroundColor"] as? NSNumber { bg = Self.colorFromARGB(n.intValue) }
+      }
+      if let s = dict["split"] as? NSNumber { split = s.boolValue }
+      if let rc = dict["rightCount"] as? NSNumber { rightCount = rc.intValue }
+      if let sp = dict["splitSpacing"] as? NSNumber { splitSpacingVal = CGFloat(truncating: sp) }
+      // content insets controlled by Flutter padding; keep zero here
+    }
+
+    // Preload SVG assets dynamically based on what's actually being used
+    let allAssetPaths = Set(imageAssetPaths + activeImageAssetPaths).filter { !$0.isEmpty }
+    if !allAssetPaths.isEmpty {
+      SVGImageLoader.shared.preloadAssetsFromPaths(Array(allAssetPaths))
+    }
+
+    super.init()
+
+    // Read the label font before the bars are built, so the first appearance
+    // carries it (Issue #82, found by @johndavid92).
+    if let dict = args as? [String: Any] {
+      if let ff = dict["labelFontFamily"] as? String, !ff.isEmpty { self.labelFontFamily = ff }
+      if let fs = dict["labelFontSize"] as? NSNumber, fs.doubleValue > 0 { self.labelFontSize = CGFloat(truncating: fs) }
+      self.labelFontWeight = (dict["labelFontWeight"] as? NSNumber)?.intValue
+      self.selectedLabelFontWeight = (dict["selectedLabelFontWeight"] as? NSNumber)?.intValue
+      self.currentMenus = Self.parseMenus(dict["menus"])
+      self.readItemOptions(dict)
+    }
+
+    // Flutter's text direction (#142): the tab order, badges, menus and
+    // the split halves follow it.
+    CNLayoutDirection.apply(CNLayoutDirection.read(args as? [String: Any]), to: container)
+    container.backgroundColor = .clear
+    // Always clip the container to block the iOS 26 Liquid Glass drop
+    // shadow from bleeding over modals (Issue #2). The Liquid Glass
+    // selection pill extends ~12-14pt above the bar's top edge — we make
+    // ROOM for it inside the container by positioning the bar 14pt below
+    // container.topAnchor (see constraints below) and reporting
+    // barHeight + 14pt in `getIntrinsicSize`. This way the pill (including
+    // its morph animation between tabs) renders inside the clipped
+    // container and the shadow is still blocked.
+    //
+    // NOTE on the iOS simulator: the simulator renders Liquid Glass with
+    // a software rasterizer and positions the pill slightly differently
+    // than real Metal hardware. You may see residual top-edge clipping
+    // on simulator that is NOT visible on a real iOS 26+ device. Always
+    // verify Liquid Glass behaviour on hardware before treating a
+    // visual artifact here as a bug.
+    container.clipsToBounds = true
+    container.layer.shadowOpacity = 0 // Explicitly disable layer shadow
+    if #available(iOS 13.0, *) { container.overrideUserInterfaceStyle = isDark ? .dark : .light }
+
+    let appearance: UITabBarAppearance? = {
+      if #available(iOS 13.0, *) { return self.makeAppearance() }
+      return nil
+    }()
+    func buildItems(_ range: Range<Int>) -> [UITabBarItem] {
+      var items: [UITabBarItem] = []
+      for i in range {
+        var image: UIImage? = nil
+        var selectedImage: UIImage? = nil
+
+        // Extract size for this item from sizes array
+        let imgSize: CGSize? = (i < sizes.count) ? sizes[i].flatMap { $0.doubleValue > 0 ? CGSize(width: $0.doubleValue, height: $0.doubleValue) : nil } : nil
+
+        // Priority: imageAsset > customIconBytes > SF Symbol
+        // Unselected image
+        if i < imageAssetData.count, let data = imageAssetData[i] {
+          image = Self.createImageFromData(data, format: (i < imageAssetFormats.count) ? imageAssetFormats[i] : nil, scale: iconScale, size: imgSize)
+        } else if i < imageAssetPaths.count && !imageAssetPaths[i].isEmpty {
+          image = Self.loadFlutterAsset(imageAssetPaths[i], size: imgSize)
+        } else if i < customIconBytes.count, let data = customIconBytes[i] {
+          image = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+        } else if i < symbols.count && !symbols[i].isEmpty {
+          // Apply size configuration if specified
+          if i < sizes.count, let sizeNum = sizes[i], sizeNum.doubleValue > 0 {
+            let config = UIImage.SymbolConfiguration(pointSize: CGFloat(sizeNum.doubleValue))
+            image = UIImage(systemName: symbols[i], withConfiguration: config)
+          } else {
+            image = UIImage(systemName: symbols[i])
+          }
+        }
+
+        // Selected image: Use active versions if available
+        if i < activeImageAssetData.count, let data = activeImageAssetData[i] {
+          selectedImage = Self.createImageFromData(data, format: (i < activeImageAssetFormats.count) ? activeImageAssetFormats[i] : nil, scale: iconScale, size: imgSize)
+        } else if i < activeImageAssetPaths.count && !activeImageAssetPaths[i].isEmpty {
+          selectedImage = Self.loadFlutterAsset(activeImageAssetPaths[i], size: imgSize)
+        } else if i < activeCustomIconBytes.count, let data = activeCustomIconBytes[i] {
+          selectedImage = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+        } else if i < activeSymbols.count && !activeSymbols[i].isEmpty {
+          // Apply size configuration if specified
+          if i < sizes.count, let sizeNum = sizes[i], sizeNum.doubleValue > 0 {
+            let config = UIImage.SymbolConfiguration(pointSize: CGFloat(sizeNum.doubleValue))
+            selectedImage = UIImage(systemName: activeSymbols[i], withConfiguration: config)
+          } else {
+            selectedImage = UIImage(systemName: activeSymbols[i])
+          }
+        } else {
+          selectedImage = image // Fallback to same image
+        }
+
+        let title = (i < labels.count && !labels[i].isEmpty) ? labels[i] : nil
+        let item = self.makeItem(title: title, image: image, selectedImage: selectedImage)
+        CupertinoTabBarPlatformView.applyBadge(i < badges.count ? badges[i] : nil, to: item)
+        // Adjust title position for larger icons to prevent overlap
+        // Default icon size is ~25pt
+        if i < sizes.count, let sizeNum = sizes[i], sizeNum.doubleValue > 25 {
+          let offset = CGFloat(sizeNum.doubleValue - 25)
+          item.titlePositionAdjustment = UIOffset(horizontal: 0, vertical: offset)
+        }
+        items.append(item)
+      }
+      return items
+    }
+    let count = max(labels.count, symbols.count)
+    if split && count > rightCount {
+      let leftEnd = count - rightCount
+      let left = CNDotTabBar(frame: .zero)
+      let right = CNDotTabBar(frame: .zero)
+      tabBarLeft = left; tabBarRight = right
+      left.translatesAutoresizingMaskIntoConstraints = false
+      right.translatesAutoresizingMaskIntoConstraints = false
+      // iOS 26+: leave bars unclipped so the Liquid Glass selection pill
+      // can render past their top edge into the container's 6pt headroom.
+      // Container is still clipped (above) so the bigger drop shadow
+      // can't escape the platform view bounds.
+      // iOS < 26: clip the bars to contain the legacy hairline shadow.
+      if #available(iOS 26.0, *) {
+        left.clipsToBounds = false; right.clipsToBounds = false
+      } else {
+        left.clipsToBounds = true; right.clipsToBounds = true
+      }
+      left.layer.shadowOpacity = 0; right.layer.shadowOpacity = 0
+      // Belt-and-suspenders: legacy shadowImage API also disables the top hairline,
+      // which iOS 26+ Liquid Glass can still render despite UITabBarAppearance.shadowImage.
+      left.shadowImage = UIImage(); right.shadowImage = UIImage()
+      left.delegate = self; right.delegate = self
+      watchTouches(of: left); watchTouches(of: right)
+      if let bg = bg { left.barTintColor = bg; right.barTintColor = bg }
+      if #available(iOS 10.0, *), let tint = tint { left.tintColor = tint; right.tintColor = tint }
+      if let ap = appearance { if #available(iOS 13.0, *) { left.standardAppearance = ap; right.standardAppearance = ap; if #available(iOS 15.0, *) { left.scrollEdgeAppearance = ap; right.scrollEdgeAppearance = ap } } }
+
+      left.items = buildItems(0..<leftEnd)
+      right.items = buildItems(leftEnd..<count)
+      if selectedIndex < leftEnd, let items = left.items {
+        left.selectedItem = items[selectedIndex]
+        right.selectedItem = nil
+      } else if let items = right.items {
+        let idx = selectedIndex - leftEnd
+        if idx >= 0 && idx < items.count { right.selectedItem = items[idx] }
+        left.selectedItem = nil
+      }
+      container.addSubview(left); container.addSubview(right)
+      // Compute content-fitting widths for both bars and apply symmetric spacing
+      let spacing: CGFloat = splitSpacingVal
+      let leftWidth = left.sizeThatFits(.zero).width + leftInset * 2
+      let rightWidth = right.sizeThatFits(.zero).width + rightInset * 2
+      let total = leftWidth + rightWidth + spacing
+      
+      // Ensure minimum width for single items to maintain circular shape
+      // Following Apple's HIG: minimum 44pt touch target, with 8pt spacing
+      let minItemWidth: CGFloat = 44.0 // Apple's minimum touch target size
+      let adjustedRightWidth = max(rightWidth, minItemWidth * CGFloat(rightCount))
+      let adjustedLeftWidth = max(leftWidth, minItemWidth * CGFloat(count - rightCount))
+      let adjustedTotal = adjustedLeftWidth + adjustedRightWidth + spacing
+      
+      // If total exceeds container, fall back to proportional widths
+      if adjustedTotal > container.bounds.width {
+        let rightFraction = CGFloat(rightCount) / CGFloat(count)
+        let rightWidth = right.widthAnchor.constraint(equalTo: container.widthAnchor, multiplier: rightFraction)
+        rightWidth.priority = .defaultHigh
+        let rightMinWidth = right.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minSplitRightWidth)
+        rightMinWidth.priority = .init(999)
+        let rTop = right.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+        let rBottom = right.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        let lTop = left.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+        let lBottom = left.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        // Lower priority so UIKit can break these against `_UITemporaryLayoutHeight = 0`
+        // during the initial layout pass without logging an unsatisfiable-constraints warning.
+        rTop.priority = .defaultHigh
+        rBottom.priority = .defaultHigh
+        lTop.priority = .defaultHigh
+        lBottom.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+          right.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -rightInset),
+          rTop,
+          rBottom,
+          rightWidth,
+          rightMinWidth,
+          left.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leftInset),
+          left.trailingAnchor.constraint(equalTo: right.leadingAnchor, constant: -spacing + 2 * Self.splitCapsuleMargin),
+          lTop,
+          lBottom,
+        ])
+      } else {
+        let rTop = right.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+        let rBottom = right.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        let lTop = left.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+        let lBottom = left.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        rTop.priority = .defaultHigh
+        rBottom.priority = .defaultHigh
+        lTop.priority = .defaultHigh
+        lBottom.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+          // Right bar fixed width, pinned to trailing
+          right.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -rightInset),
+          rTop,
+          rBottom,
+          right.widthAnchor.constraint(equalToConstant: adjustedRightWidth),
+          // Left bar fixed width, pinned to leading
+          left.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leftInset),
+          lTop,
+          lBottom,
+          left.widthAnchor.constraint(equalToConstant: adjustedLeftWidth),
+          // Spacing between
+          left.trailingAnchor.constraint(lessThanOrEqualTo: right.leadingAnchor, constant: -spacing),
+        ])
+      }
+      // Force layout update for background and text rendering on iOS < 16
+      // Re-assign items after layout to ensure labels render properly
+      // Capture selectedIndex for restoration after item re-assignment
+      let capturedSelectedIndex = selectedIndex
+      let capturedLeftEnd = leftEnd
+      DispatchQueue.main.async { [weak self, weak left, weak right] in
+        guard let self = self, let left = left, let right = right else { return }
+        self.container.setNeedsLayout()
+        self.container.layoutIfNeeded()
+        left.setNeedsLayout()
+        left.layoutIfNeeded()
+        right.setNeedsLayout()
+        right.layoutIfNeeded()
+        // Re-assign items to force label rendering
+        let leftItems = left.items
+        let rightItems = right.items
+        left.items = leftItems
+        right.items = rightItems
+        // Restore selection after re-assigning items (re-assignment can reset selection)
+        if capturedSelectedIndex < capturedLeftEnd, let items = left.items, capturedSelectedIndex < items.count {
+          left.selectedItem = items[capturedSelectedIndex]
+          right.selectedItem = nil
+        } else if let items = right.items {
+          let idx = capturedSelectedIndex - capturedLeftEnd
+          if idx >= 0 && idx < items.count {
+            right.selectedItem = items[idx]
+            left.selectedItem = nil
+          }
+        }
+        // Force another update cycle for text rendering
+        DispatchQueue.main.async { [weak left, weak right] in
+          guard let left = left, let right = right else { return }
+          left.setNeedsDisplay()
+          right.setNeedsDisplay()
+          left.setNeedsLayout()
+          left.layoutIfNeeded()
+          right.setNeedsLayout()
+          right.layoutIfNeeded()
+        }
+      }
+    } else {
+      let bar = CNDotTabBar(frame: .zero)
+      tabBar = bar
+      bar.delegate = self
+      watchTouches(of: bar)
+      bar.translatesAutoresizingMaskIntoConstraints = false
+      // iOS 26+: leave the bar unclipped so the Liquid Glass selection pill
+      // can render into the container's 6pt headroom. Container clip blocks
+      // the bigger drop shadow.
+      // iOS < 26: clip to contain the legacy hairline shadow.
+      if #available(iOS 26.0, *) {
+        bar.clipsToBounds = false
+      } else {
+        bar.clipsToBounds = true
+      }
+      bar.layer.shadowOpacity = 0
+      // Belt-and-suspenders: legacy shadowImage API also disables the top hairline,
+      // which iOS 26+ Liquid Glass can still render despite UITabBarAppearance.shadowImage.
+      bar.shadowImage = UIImage()
+      if let bg = bg { bar.barTintColor = bg }
+      if #available(iOS 10.0, *), let tint = tint { bar.tintColor = tint }
+      if let ap = appearance { if #available(iOS 13.0, *) { bar.standardAppearance = ap; if #available(iOS 15.0, *) { bar.scrollEdgeAppearance = ap } } }
+      bar.items = buildItems(0..<count)
+      if selectedIndex >= 0, let items = bar.items, selectedIndex < items.count { bar.selectedItem = items[selectedIndex] }
+      container.addSubview(bar)
+      let barTop = bar.topAnchor.constraint(equalTo: container.topAnchor, constant: 14)
+      let barBottom = bar.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+      // Lower priority so UIKit can break these against `_UITemporaryLayoutHeight = 0`
+      // during the initial layout pass without logging an unsatisfiable-constraints warning.
+      barTop.priority = .defaultHigh
+      barBottom.priority = .defaultHigh
+      NSLayoutConstraint.activate([
+        bar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+        bar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        barTop,
+        barBottom,
+      ])
+      // Force layout update for background and text rendering on iOS < 16
+      // Re-assign items after layout to ensure labels render properly.
+      // Mirror the split-bar branch: capture selectedIndex BEFORE the async,
+      // restore it AFTER the items reassignment. UITabBar resets selectedItem
+      // to nil when `bar.items = ...` is reassigned — without this restore,
+      // the bar visually jumps to index 0 (or no selection) for the ~50ms
+      // until Dart's post-create setSelectedIndex lands, which the user
+      // perceives as an animation from 0 to the current index after a
+      // modal-close recreate.
+      let capturedSelectedIndex = selectedIndex
+      DispatchQueue.main.async { [weak self, weak bar] in
+        guard let self = self, let bar = bar else { return }
+        self.container.setNeedsLayout()
+        self.container.layoutIfNeeded()
+        bar.setNeedsLayout()
+        bar.layoutIfNeeded()
+        // Re-assign items to force label rendering, then restore selection.
+        UIView.performWithoutAnimation {
+          let items = bar.items
+          bar.items = items
+          if capturedSelectedIndex >= 0,
+             let items = bar.items,
+             capturedSelectedIndex < items.count {
+            bar.selectedItem = items[capturedSelectedIndex]
+          }
+        }
+        // Force another update cycle for text rendering
+        DispatchQueue.main.async { [weak bar] in
+          guard let bar = bar else { return }
+          bar.setNeedsDisplay()
+          bar.setNeedsLayout()
+          bar.layoutIfNeeded()
+        }
+      }
+    }
+    // Store split settings for future updates
+    self.isSplit = split
+    self.rightCountVal = rightCount
+    self.currentLabels = labels
+    self.currentSymbols = symbols
+    self.currentActiveSymbols = activeSymbols
+    self.currentBadges = badges
+    self.currentCustomIconBytes = customIconBytes
+    self.currentActiveCustomIconBytes = activeCustomIconBytes
+    self.currentImageAssetPaths = imageAssetPaths
+    self.currentActiveImageAssetPaths = activeImageAssetPaths
+    self.currentImageAssetData = imageAssetData
+    self.currentActiveImageAssetData = activeImageAssetData
+    self.currentImageAssetFormats = imageAssetFormats
+    self.currentActiveImageAssetFormats = activeImageAssetFormats
+    self.iconScale = iconScale
+    self.leftInsetVal = leftInset
+    self.rightInsetVal = rightInset
+    self.currentIconSizes = sizes.compactMap { $0 }.map { CGFloat(truncating: $0) }
+    self.currentIndex = selectedIndex
+    applyMenus()
+channel.setMethodCallHandler { [weak self] call, result in
+      guard let self = self else { result(nil); return }
+      switch call.method {
+      case "getIntrinsicSize":
+        if let bar = self.tabBar ?? self.tabBarLeft ?? self.tabBarRight {
+          let size = bar.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
+          // Adjust height for larger icons - default icon is ~25pt, default height is ~49pt
+          let defaultIconSize: CGFloat = 25.0
+          let maxIconSize = self.currentIconSizes.max() ?? defaultIconSize
+          let extraHeight = max(0, maxIconSize - defaultIconSize)
+          // +14pt pill room: container is clipped (Issue #2 shadow fix), and
+          // the iOS 26 Liquid Glass selection pill — including its morphing
+          // animation between tabs — extends ~12-14pt above the bar's top
+          // edge. We position the bar 14pt below container.top via the
+          // layout constraints, and report height + 14 here so Flutter
+          // reserves space matching what the platform view actually needs.
+          let pillTopRoom: CGFloat = 14.0
+          let dynamicHeight = size.height + extraHeight + pillTopRoom
+          result(["width": Double(size.width), "height": Double(dynamicHeight)])
+        } else {
+          result(["width": Double(self.container.bounds.width), "height": 50.0])
+        }
+      case "setItems":
+        if let args = call.arguments as? [String: Any] {
+          let labels = (args["labels"] as? [String]) ?? []
+          let symbols = (args["sfSymbols"] as? [String]) ?? []
+          let activeSymbols = (args["activeSfSymbols"] as? [String]) ?? []
+          let badges = (args["badges"] as? [String]) ?? []
+          let sizes = (args["sfSymbolSizes"] as? [NSNumber?]) ?? []
+          var customIconBytes: [Data?] = []
+          var activeCustomIconBytes: [Data?] = []
+          var imageAssetPaths: [String] = []
+          var activeImageAssetPaths: [String] = []
+          var imageAssetData: [Data?] = []
+          var activeImageAssetData: [Data?] = []
+          var imageAssetFormats: [String] = []
+          var activeImageAssetFormats: [String] = []
+          if let bytesArray = args["customIconBytes"] as? [FlutterStandardTypedData?] {
+            customIconBytes = bytesArray.map { $0?.data }
+          }
+          if let bytesArray = args["activeCustomIconBytes"] as? [FlutterStandardTypedData?] {
+            activeCustomIconBytes = bytesArray.map { $0?.data }
+          }
+          imageAssetPaths = (args["imageAssetPaths"] as? [String]) ?? []
+          activeImageAssetPaths = (args["activeImageAssetPaths"] as? [String]) ?? []
+          if let bytesArray = args["imageAssetData"] as? [FlutterStandardTypedData?] {
+            imageAssetData = bytesArray.map { $0?.data }
+          }
+          if let bytesArray = args["activeImageAssetData"] as? [FlutterStandardTypedData?] {
+            activeImageAssetData = bytesArray.map { $0?.data }
+          }
+          imageAssetFormats = (args["imageAssetFormats"] as? [String]) ?? []
+          activeImageAssetFormats = (args["activeImageAssetFormats"] as? [String]) ?? []
+          if let scale = args["iconScale"] as? NSNumber {
+            self.iconScale = CGFloat(truncating: scale)
+          }
+          let selectedIndex = (args["selectedIndex"] as? NSNumber)?.intValue ?? 0
+          self.currentIndex = selectedIndex
+          self.readItemOptions(args)
+          self.currentLabels = labels
+          self.currentSymbols = symbols
+          self.currentActiveSymbols = activeSymbols
+          self.currentBadges = badges
+          self.currentCustomIconBytes = customIconBytes
+          self.currentActiveCustomIconBytes = activeCustomIconBytes
+          self.currentImageAssetPaths = imageAssetPaths
+          self.currentActiveImageAssetPaths = activeImageAssetPaths
+          self.currentImageAssetData = imageAssetData
+          self.currentActiveImageAssetData = activeImageAssetData
+          self.currentImageAssetFormats = imageAssetFormats
+          self.currentActiveImageAssetFormats = activeImageAssetFormats
+          // Store icon sizes for dynamic height calculation
+          self.currentIconSizes = sizes.compactMap { $0?.doubleValue }.map { CGFloat($0) }
+          func buildItems(_ range: Range<Int>) -> [UITabBarItem] {
+            var items: [UITabBarItem] = []
+            for i in range {
+              var image: UIImage? = nil
+              var selectedImage: UIImage? = nil
+
+              // Extract size for this item from sizes array
+              let imgSize: CGSize? = (i < sizes.count) ? sizes[i].flatMap { $0.doubleValue > 0 ? CGSize(width: $0.doubleValue, height: $0.doubleValue) : nil } : nil
+
+              // Priority: imageAsset > customIconBytes > SF Symbol
+              // Unselected image
+              if i < imageAssetData.count, let data = imageAssetData[i] {
+                image = Self.createImageFromData(data, format: (i < imageAssetFormats.count) ? imageAssetFormats[i] : nil, scale: self.iconScale, size: imgSize)
+              } else if i < imageAssetPaths.count && !imageAssetPaths[i].isEmpty {
+                image = Self.loadFlutterAsset(imageAssetPaths[i], size: imgSize)
+              } else if i < customIconBytes.count, let data = customIconBytes[i] {
+                image = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+              } else if i < symbols.count && !symbols[i].isEmpty {
+                // Apply size configuration if specified
+                if i < sizes.count, let sizeNum = sizes[i], sizeNum.doubleValue > 0 {
+                  let config = UIImage.SymbolConfiguration(pointSize: CGFloat(sizeNum.doubleValue))
+                  image = UIImage(systemName: symbols[i], withConfiguration: config)
+                } else {
+                  image = UIImage(systemName: symbols[i])
+                }
+              }
+
+              // Selected image: Use active versions if available
+              if i < activeImageAssetData.count, let data = activeImageAssetData[i] {
+                selectedImage = Self.createImageFromData(data, format: (i < activeImageAssetFormats.count) ? activeImageAssetFormats[i] : nil, scale: self.iconScale, size: imgSize)
+              } else if i < activeImageAssetPaths.count && !activeImageAssetPaths[i].isEmpty {
+                selectedImage = Self.loadFlutterAsset(activeImageAssetPaths[i], size: imgSize)
+              } else if i < activeCustomIconBytes.count, let data = activeCustomIconBytes[i] {
+                selectedImage = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+              } else if i < activeSymbols.count && !activeSymbols[i].isEmpty {
+                // Apply size configuration if specified
+                if i < sizes.count, let sizeNum = sizes[i], sizeNum.doubleValue > 0 {
+                  let config = UIImage.SymbolConfiguration(pointSize: CGFloat(sizeNum.doubleValue))
+                  selectedImage = UIImage(systemName: activeSymbols[i], withConfiguration: config)
+                } else {
+                  selectedImage = UIImage(systemName: activeSymbols[i])
+                }
+              } else {
+                selectedImage = image // Fallback to same image
+              }
+
+              let title = (i < labels.count && !labels[i].isEmpty) ? labels[i] : nil
+              let item = self.makeItem(title: title, image: image, selectedImage: selectedImage)
+              CupertinoTabBarPlatformView.applyBadge(i < badges.count ? badges[i] : nil, to: item)
+              // Adjust title position for larger icons to prevent overlap
+              if i < sizes.count, let sizeNum = sizes[i] {
+                let pointSize = sizeNum.doubleValue
+                if pointSize > 25 {
+                  let offset = CGFloat(pointSize - 25)
+                  item.titlePositionAdjustment = UIOffset(horizontal: 0, vertical: offset)
+                }
+              }
+              items.append(item)
+            }
+            return items
+          }
+          let count = max(labels.count, symbols.count)
+          if self.isSplit && count > self.rightCountVal, let left = self.tabBarLeft, let right = self.tabBarRight {
+            let leftEnd = count - self.rightCountVal
+            left.items = buildItems(0..<leftEnd)
+            right.items = buildItems(leftEnd..<count)
+            if selectedIndex < leftEnd, let items = left.items { left.selectedItem = items[selectedIndex]; right.selectedItem = nil }
+            else if let items = right.items {
+              let idx = selectedIndex - leftEnd
+              if idx >= 0 && idx < items.count { right.selectedItem = items[idx]; left.selectedItem = nil }
+            }
+            self.applyMenus()
+            result(nil)
+          } else if let bar = self.tabBar {
+            bar.items = buildItems(0..<count)
+            if let items = bar.items, selectedIndex >= 0, selectedIndex < items.count { bar.selectedItem = items[selectedIndex] }
+            self.applyMenus()
+            result(nil)
+          } else {
+            result(FlutterError(code: "state_error", message: "Tab bars not initialized", details: nil))
+          }
+        } else { result(FlutterError(code: "bad_args", message: "Missing items", details: nil)) }
+      case "setLayout":
+        if let args = call.arguments as? [String: Any] {
+          let split = (args["split"] as? NSNumber)?.boolValue ?? false
+          let rightCount = (args["rightCount"] as? NSNumber)?.intValue ?? 1
+          // Insets are controlled by Flutter padding; keep stored zeros here
+          let leftInset = self.leftInsetVal
+          let rightInset = self.rightInsetVal
+          if let sp = args["splitSpacing"] as? NSNumber { self.splitSpacingVal = CGFloat(truncating: sp) }
+          let selectedIndex = (args["selectedIndex"] as? NSNumber)?.intValue ?? 0
+          self.currentIndex = selectedIndex
+          // Remove existing bars
+          self.tabBar?.removeFromSuperview(); self.tabBar = nil
+          self.tabBarLeft?.removeFromSuperview(); self.tabBarLeft = nil
+          self.tabBarRight?.removeFromSuperview(); self.tabBarRight = nil
+          let labels = self.currentLabels
+          let symbols = self.currentSymbols
+          let activeSymbols = self.currentActiveSymbols
+          let badges = self.currentBadges
+          let customIconBytes = self.currentCustomIconBytes
+          let activeCustomIconBytes = self.currentActiveCustomIconBytes
+          let imageAssetPaths = self.currentImageAssetPaths
+          let activeImageAssetPaths = self.currentActiveImageAssetPaths
+          let imageAssetData = self.currentImageAssetData
+          let activeImageAssetData = self.currentActiveImageAssetData
+          let imageAssetFormats = self.currentImageAssetFormats
+          let activeImageAssetFormats = self.currentActiveImageAssetFormats
+          let appearance: UITabBarAppearance? = {
+            if #available(iOS 13.0, *) { return self.makeAppearance() }
+            return nil
+          }()
+          let iconSizes = self.currentIconSizes
+          func buildItems(_ range: Range<Int>) -> [UITabBarItem] {
+            var items: [UITabBarItem] = []
+            for i in range {
+              var image: UIImage? = nil
+              var selectedImage: UIImage? = nil
+
+              // Extract size for this item from stored icon sizes
+              let imgSize: CGSize? = (i < iconSizes.count && iconSizes[i] > 0) ? CGSize(width: iconSizes[i], height: iconSizes[i]) : nil
+
+              // Priority: imageAsset > customIconBytes > SF Symbol
+              // Unselected image
+              if i < imageAssetData.count, let data = imageAssetData[i] {
+                image = Self.createImageFromData(data, format: (i < imageAssetFormats.count) ? imageAssetFormats[i] : nil, scale: self.iconScale, size: imgSize)
+              } else if i < imageAssetPaths.count && !imageAssetPaths[i].isEmpty {
+                image = Self.loadFlutterAsset(imageAssetPaths[i], size: imgSize)
+              } else if i < customIconBytes.count, let data = customIconBytes[i] {
+                image = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+              } else if i < symbols.count && !symbols[i].isEmpty {
+                // Apply size configuration if stored
+                if i < iconSizes.count && iconSizes[i] > 0 {
+                  let config = UIImage.SymbolConfiguration(pointSize: iconSizes[i])
+                  image = UIImage(systemName: symbols[i], withConfiguration: config)
+                } else {
+                  image = UIImage(systemName: symbols[i])
+                }
+              }
+
+              // Selected image: Use active versions if available
+              if i < activeImageAssetData.count, let data = activeImageAssetData[i] {
+                selectedImage = Self.createImageFromData(data, format: (i < activeImageAssetFormats.count) ? activeImageAssetFormats[i] : nil, scale: self.iconScale, size: imgSize)
+              } else if i < activeImageAssetPaths.count && !activeImageAssetPaths[i].isEmpty {
+                selectedImage = Self.loadFlutterAsset(activeImageAssetPaths[i], size: imgSize)
+              } else if i < activeCustomIconBytes.count, let data = activeCustomIconBytes[i] {
+                selectedImage = UIImage(data: data, scale: self.iconScale)?.withRenderingMode(.alwaysTemplate)
+              } else if i < activeSymbols.count && !activeSymbols[i].isEmpty {
+                // Apply size configuration if stored
+                if i < iconSizes.count && iconSizes[i] > 0 {
+                  let config = UIImage.SymbolConfiguration(pointSize: iconSizes[i])
+                  selectedImage = UIImage(systemName: activeSymbols[i], withConfiguration: config)
+                } else {
+                  selectedImage = UIImage(systemName: activeSymbols[i])
+                }
+              } else {
+                selectedImage = image // Fallback to same image
+              }
+
+              let title = (i < labels.count && !labels[i].isEmpty) ? labels[i] : nil
+              let item = self.makeItem(title: title, image: image, selectedImage: selectedImage)
+              CupertinoTabBarPlatformView.applyBadge(i < badges.count ? badges[i] : nil, to: item)
+              items.append(item)
+            }
+            return items
+          }
+          let count = max(labels.count, symbols.count)
+          if split && count > rightCount {
+            let leftEnd = count - rightCount
+            let left = CNDotTabBar(frame: .zero)
+            let right = CNDotTabBar(frame: .zero)
+            self.tabBarLeft = left; self.tabBarRight = right
+            left.translatesAutoresizingMaskIntoConstraints = false
+            right.translatesAutoresizingMaskIntoConstraints = false
+            // iOS 26+: leave unclipped for pill overflow into 6pt headroom.
+            // iOS < 26: clip to contain the legacy hairline shadow.
+            if #available(iOS 26.0, *) {
+              left.clipsToBounds = false; right.clipsToBounds = false
+            } else {
+              left.clipsToBounds = true; right.clipsToBounds = true
+            }
+            left.layer.shadowOpacity = 0; right.layer.shadowOpacity = 0
+            left.shadowImage = UIImage(); right.shadowImage = UIImage()
+            left.delegate = self; right.delegate = self
+            self.watchTouches(of: left); self.watchTouches(of: right)
+            if let ap = appearance { if #available(iOS 13.0, *) { left.standardAppearance = ap; right.standardAppearance = ap; if #available(iOS 15.0, *) { left.scrollEdgeAppearance = ap; right.scrollEdgeAppearance = ap } } }
+            left.items = buildItems(0..<leftEnd)
+            right.items = buildItems(leftEnd..<count)
+            if selectedIndex < leftEnd, let items = left.items { left.selectedItem = items[selectedIndex]; right.selectedItem = nil }
+            else if let items = right.items { let idx = selectedIndex - leftEnd; if idx >= 0 && idx < items.count { right.selectedItem = items[idx]; left.selectedItem = nil } }
+            self.container.addSubview(left); self.container.addSubview(right)
+            let spacing: CGFloat = splitSpacingVal
+            let leftWidth = left.sizeThatFits(.zero).width + leftInset * 2
+            let rightWidth = right.sizeThatFits(.zero).width + rightInset * 2
+            let total = leftWidth + rightWidth + spacing
+            
+            // Ensure minimum width for single items to maintain circular shape
+            let minItemWidth: CGFloat = 50.0 // Minimum width per item
+            let adjustedRightWidth = max(rightWidth, minItemWidth * CGFloat(rightCount))
+            let adjustedLeftWidth = max(leftWidth, minItemWidth * CGFloat(count - rightCount))
+            let adjustedTotal = adjustedLeftWidth + adjustedRightWidth + spacing
+            
+            if adjustedTotal > self.container.bounds.width {
+              let rightFraction = CGFloat(rightCount) / CGFloat(count)
+              let rightWidth = right.widthAnchor.constraint(equalTo: self.container.widthAnchor, multiplier: rightFraction)
+              rightWidth.priority = .defaultHigh
+              let rightMinWidth = right.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.minSplitRightWidth)
+              rightMinWidth.priority = .init(999)
+              let rTop = right.topAnchor.constraint(equalTo: self.container.topAnchor, constant: 14)
+              let rBottom = right.bottomAnchor.constraint(equalTo: self.container.bottomAnchor)
+              let lTop = left.topAnchor.constraint(equalTo: self.container.topAnchor, constant: 14)
+              let lBottom = left.bottomAnchor.constraint(equalTo: self.container.bottomAnchor)
+              rTop.priority = .defaultHigh
+              rBottom.priority = .defaultHigh
+              lTop.priority = .defaultHigh
+              lBottom.priority = .defaultHigh
+              NSLayoutConstraint.activate([
+                right.trailingAnchor.constraint(equalTo: self.container.trailingAnchor, constant: -rightInset),
+                rTop,
+                rBottom,
+                rightWidth,
+                rightMinWidth,
+                left.leadingAnchor.constraint(equalTo: self.container.leadingAnchor, constant: leftInset),
+                left.trailingAnchor.constraint(equalTo: right.leadingAnchor, constant: -spacing + 2 * Self.splitCapsuleMargin),
+                lTop,
+                lBottom,
+              ])
+            } else {
+              let rTop = right.topAnchor.constraint(equalTo: self.container.topAnchor, constant: 14)
+              let rBottom = right.bottomAnchor.constraint(equalTo: self.container.bottomAnchor)
+              let lTop = left.topAnchor.constraint(equalTo: self.container.topAnchor, constant: 14)
+              let lBottom = left.bottomAnchor.constraint(equalTo: self.container.bottomAnchor)
+              rTop.priority = .defaultHigh
+              rBottom.priority = .defaultHigh
+              lTop.priority = .defaultHigh
+              lBottom.priority = .defaultHigh
+              NSLayoutConstraint.activate([
+                right.trailingAnchor.constraint(equalTo: self.container.trailingAnchor, constant: -rightInset),
+                rTop,
+                rBottom,
+                right.widthAnchor.constraint(equalToConstant: adjustedRightWidth),
+                left.leadingAnchor.constraint(equalTo: self.container.leadingAnchor, constant: leftInset),
+                lTop,
+                lBottom,
+                left.widthAnchor.constraint(equalToConstant: adjustedLeftWidth),
+                left.trailingAnchor.constraint(lessThanOrEqualTo: right.leadingAnchor, constant: -spacing),
+              ])
+            }
+            // Force layout update for background and text rendering on iOS < 16
+            // Re-assign items after layout to ensure labels render properly
+            // Capture selectedIndex for restoration after item re-assignment
+            let capturedSelectedIndex = selectedIndex
+            let capturedLeftEnd = leftEnd
+            DispatchQueue.main.async { [weak self, weak left, weak right] in
+              guard let self = self, let left = left, let right = right else { return }
+              self.container.setNeedsLayout()
+              self.container.layoutIfNeeded()
+              left.setNeedsLayout()
+              left.layoutIfNeeded()
+              right.setNeedsLayout()
+              right.layoutIfNeeded()
+              // Re-assign items to force label rendering
+              let leftItems = left.items
+              let rightItems = right.items
+              left.items = leftItems
+              right.items = rightItems
+              // Restore selection after re-assigning items (re-assignment can reset selection)
+              if capturedSelectedIndex < capturedLeftEnd, let items = left.items, capturedSelectedIndex < items.count {
+                left.selectedItem = items[capturedSelectedIndex]
+                right.selectedItem = nil
+              } else if let items = right.items {
+                let idx = capturedSelectedIndex - capturedLeftEnd
+                if idx >= 0 && idx < items.count {
+                  right.selectedItem = items[idx]
+                  left.selectedItem = nil
+                }
+              }
+              // Force another update cycle for text rendering
+              DispatchQueue.main.async { [weak left, weak right] in
+                guard let left = left, let right = right else { return }
+                left.setNeedsDisplay()
+                right.setNeedsDisplay()
+                left.setNeedsLayout()
+                left.layoutIfNeeded()
+                right.setNeedsLayout()
+                right.layoutIfNeeded()
+              }
+            }
+          } else {
+            let bar = CNDotTabBar(frame: .zero)
+            self.tabBar = bar
+            bar.delegate = self
+            self.watchTouches(of: bar)
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            // iOS 26+: leave unclipped for pill overflow into 6pt headroom.
+            // iOS < 26: clip to contain the legacy hairline shadow.
+            if #available(iOS 26.0, *) {
+              bar.clipsToBounds = false
+            } else {
+              bar.clipsToBounds = true
+            }
+            bar.layer.shadowOpacity = 0
+            bar.shadowImage = UIImage()
+            if let ap = appearance { if #available(iOS 13.0, *) { bar.standardAppearance = ap; if #available(iOS 15.0, *) { bar.scrollEdgeAppearance = ap } } }
+            bar.items = buildItems(0..<count)
+            if let items = bar.items, selectedIndex >= 0, selectedIndex < items.count { bar.selectedItem = items[selectedIndex] }
+            self.container.addSubview(bar)
+            let barTop = bar.topAnchor.constraint(equalTo: self.container.topAnchor, constant: 14)
+            let barBottom = bar.bottomAnchor.constraint(equalTo: self.container.bottomAnchor)
+            barTop.priority = .defaultHigh
+            barBottom.priority = .defaultHigh
+            NSLayoutConstraint.activate([
+              bar.leadingAnchor.constraint(equalTo: self.container.leadingAnchor),
+              bar.trailingAnchor.constraint(equalTo: self.container.trailingAnchor),
+              barTop,
+              barBottom,
+            ])
+            // Force layout update for background and text rendering on iOS < 16
+            // Re-assign items after layout to ensure labels render properly
+            DispatchQueue.main.async { [weak self, weak bar] in
+              guard let self = self, let bar = bar else { return }
+              self.container.setNeedsLayout()
+              self.container.layoutIfNeeded()
+              bar.setNeedsLayout()
+              bar.layoutIfNeeded()
+              // Re-assign items to force label rendering
+              let items = bar.items
+              bar.items = items
+              // Force another update cycle for text rendering
+              DispatchQueue.main.async { [weak bar] in
+                guard let bar = bar else { return }
+                bar.setNeedsDisplay()
+                bar.setNeedsLayout()
+                bar.layoutIfNeeded()
+              }
+            }
+          }
+          self.isSplit = split; self.rightCountVal = rightCount; self.leftInsetVal = leftInset; self.rightInsetVal = rightInset
+          self.applyMenus()
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing layout", details: nil)) }
+      case "setMenus":
+        self.currentMenus = Self.parseMenus((call.arguments as? [String: Any])?["menus"])
+        self.applyMenus()
+        result(nil)
+      case "setSelectedIndex":
+        if let args = call.arguments as? [String: Any], let idx = (args["index"] as? NSNumber)?.intValue {
+          self.currentIndex = idx
+          // Defense-in-depth against the modal-recreate flow: suppress the
+          // iOS 26 Liquid Glass selection-pill morph animation. Without this,
+          // if Dart pushes setSelectedIndex over an existing channel (post-
+          // create settle at +50ms / +200ms, or any _syncPropsToNativeIfNeeded
+          // call) and the bar happened to be at a different index, the pill
+          // would animate across. Mirrors the pattern used in the `refresh`
+          // case below (line 938).
+          // Single bar
+          if let bar = self.tabBar, let items = bar.items, idx >= 0, idx < items.count {
+            UIView.performWithoutAnimation { bar.selectedItem = items[idx] }
+            result(nil)
+            return
+          }
+          // Split bars
+          if let left = self.tabBarLeft, let leftItems = left.items {
+            if idx < leftItems.count, idx >= 0 {
+              UIView.performWithoutAnimation {
+                left.selectedItem = leftItems[idx]
+                self.tabBarRight?.selectedItem = nil
+              }
+              result(nil)
+              return
+            }
+            if let right = self.tabBarRight, let rightItems = right.items {
+              let ridx = idx - leftItems.count
+              if ridx >= 0, ridx < rightItems.count {
+                UIView.performWithoutAnimation {
+                  right.selectedItem = rightItems[ridx]
+                  self.tabBarLeft?.selectedItem = nil
+                }
+                result(nil)
+                return
+              }
+            }
+          }
+          result(FlutterError(code: "bad_args", message: "Index out of range", details: nil))
+        } else { result(FlutterError(code: "bad_args", message: "Missing index", details: nil)) }
+      case "setStyle":
+        if let args = call.arguments as? [String: Any] {
+          if let n = args["tint"] as? NSNumber {
+            let c = Self.colorFromARGB(n.intValue)
+            if let bar = self.tabBar { bar.tintColor = c }
+            if let left = self.tabBarLeft { left.tintColor = c }
+            if let right = self.tabBarRight { right.tintColor = c }
+          }
+          if let n = args["backgroundColor"] as? NSNumber {
+            let c = Self.colorFromARGB(n.intValue)
+            if let bar = self.tabBar { bar.barTintColor = c }
+            if let left = self.tabBarLeft { left.barTintColor = c }
+            if let right = self.tabBarRight { right.barTintColor = c }
+          }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing style", details: nil)) }
+      case "setLayoutDirection":
+        CNLayoutDirection.apply(CNLayoutDirection.read(call.arguments as? [String: Any]), to: self.container)
+        for bar in [self.tabBar, self.tabBarLeft, self.tabBarRight].compactMap({ $0 }) { bar.setNeedsLayout() }
+        result(nil)
+      case "setBrightness":
+        if let args = call.arguments as? [String: Any], let isDark = (args["isDark"] as? NSNumber)?.boolValue {
+          if #available(iOS 13.0, *) { self.container.overrideUserInterfaceStyle = isDark ? .dark : .light }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing isDark", details: nil)) }
+      case "setBadges":
+        // Lightweight badge-only update without rebuilding items
+        if let args = call.arguments as? [String: Any], let badges = args["badges"] as? [String] {
+          self.currentBadges = badges
+          // Update single bar
+          if let bar = self.tabBar, let items = bar.items {
+            for (i, item) in items.enumerated() {
+              CupertinoTabBarPlatformView.applyBadge(i < badges.count ? badges[i] : nil, to: item)
+            }
+          }
+          // Update split bars
+          if let left = self.tabBarLeft, let leftItems = left.items,
+             let right = self.tabBarRight, let rightItems = right.items {
+            let leftEnd = leftItems.count
+            for (i, item) in leftItems.enumerated() {
+              CupertinoTabBarPlatformView.applyBadge(i < badges.count ? badges[i] : nil, to: item)
+            }
+            for (i, item) in rightItems.enumerated() {
+              let badgeIndex = leftEnd + i
+              CupertinoTabBarPlatformView.applyBadge(badgeIndex < badges.count ? badges[badgeIndex] : nil, to: item)
+            }
+          }
+          self.tabBar?.setNeedsLayout()
+          self.tabBarLeft?.setNeedsLayout()
+          self.tabBarRight?.setNeedsLayout()
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing badges", details: nil)) }
+      case "setFont":
+        // Update label font and re-apply appearance to all tab bars
+        if let args = call.arguments as? [String: Any] {
+          let oldRaise = self.iconRaise
+          self.labelFontFamily = (args["labelFontFamily"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+          self.labelFontSize = (args["labelFontSize"] as? NSNumber).map { CGFloat(truncating: $0) } ?? 0
+          self.labelFontWeight = (args["labelFontWeight"] as? NSNumber)?.intValue
+          self.selectedLabelFontWeight = (args["selectedLabelFontWeight"] as? NSNumber)?.intValue
+          let raiseDelta = self.iconRaise - oldRaise
+          if #available(iOS 13.0, *) {
+            let ap = self.makeAppearance()
+            if let bar = self.tabBar {
+              bar.standardAppearance = ap
+              if #available(iOS 15.0, *) { bar.scrollEdgeAppearance = ap }
+            }
+            if let left = self.tabBarLeft {
+              left.standardAppearance = ap
+              if #available(iOS 15.0, *) { left.scrollEdgeAppearance = ap }
+            }
+            if let right = self.tabBarRight {
+              right.standardAppearance = ap
+              if #available(iOS 15.0, *) { right.scrollEdgeAppearance = ap }
+            }
+            // A new appearance does not reach item views that already exist,
+            // so re-set the items to make the bar lay them out again.
+            for bar in [self.tabBar, self.tabBarLeft, self.tabBarRight].compactMap({ $0 }) {
+              for item in bar.items ?? [] where item.title != nil {
+                item.image = self.raised(item.image, by: raiseDelta)
+                item.selectedImage = self.raised(item.selectedImage, by: raiseDelta)
+              }
+              bar.reloadItemViews()
+            }
+          }
+          result(nil)
+        } else { result(FlutterError(code: "bad_args", message: "Missing font args", details: nil)) }
+      case "refresh":
+        // Force refresh for label rendering (Issue #6).
+        // UITabBar only fully layouts labels when items are selected,
+        // so we temporarily select each item to force layout. The whole
+        // cycle runs in one main-queue block: yielding between items let
+        // Core Animation commit each intermediate selection, which showed
+        // as the Liquid Glass pill jumping through every tab on launch.
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self else { return }
+          let bars = [self.tabBar, self.tabBarLeft, self.tabBarRight].compactMap { $0 }
+          UIView.performWithoutAnimation {
+            for bar in bars {
+              guard let items = bar.items, !items.isEmpty else { continue }
+              let original = bar.selectedItem
+              // Temporarily remove delegate to prevent callbacks during refresh
+              bar.delegate = nil
+              for item in items {
+                bar.selectedItem = item
+                bar.setNeedsLayout()
+                bar.layoutIfNeeded()
+              }
+              // A split bar may have no selection; the single bar falls back to its first item.
+              bar.selectedItem = original ?? (bar === self.tabBar ? items.first : nil)
+              bar.setNeedsLayout()
+              bar.layoutIfNeeded()
+              bar.delegate = self
+            }
+          }
+        }
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+  }
+
+  deinit {
+    channel.setMethodCallHandler(nil)
+    tabBar?.delegate = nil
+    tabBarLeft?.delegate = nil
+    tabBarRight?.delegate = nil
+    tabBar?.removeFromSuperview()
+    tabBarLeft?.removeFromSuperview()
+    tabBarRight?.removeFromSuperview()
+  }
+
+  func view() -> UIView { container }
+
+  // MARK: - Touch regions (#162)
+
+  /// What Flutter was last told about where the bars take touches, in the
+  /// container's coordinates; nil for everywhere.
+  private var sentTouchRegions: [CGRect]?
+  private var touchRegionsScheduled = false
+
+  /// Has [bar] tell Flutter where it takes touches after each layout.
+  private func watchTouches(of bar: CNDotTabBar) {
+    bar.onLayout = { [weak self] in self?.scheduleTouchRegions() }
+  }
+
+  /// Tells Flutter where the bars take touches once this layout pass is
+  /// over, at most once per pass.
+  private func scheduleTouchRegions() {
+    guard !touchRegionsScheduled else { return }
+    touchRegionsScheduled = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.touchRegionsScheduled = false
+      self.sendTouchRegions()
+    }
+  }
+
+  /// The container is taller than the bars: they sit 14 pt below its top to
+  /// leave room for the Liquid Glass pill, and the iOS 26 capsule doesn't
+  /// fill a bar's width. A touch there hit the bare container, so it did
+  /// nothing; in a native app it reaches what is behind the bar. Flutter
+  /// gets the areas the bars take touches in and sends only those touches
+  /// to this view, so the others reach the Flutter content behind it.
+  /// When none are found, such as before the first layout, Flutter is told
+  /// nil and sends this view every touch on it, as before.
+  ///
+  /// The parts of icons drawn above a short bar's capsule are sent to this
+  /// view too, and the container hands their touches to the item below.
+  private func sendTouchRegions() {
+    var regions: [CGRect] = []
+    var iconAreas: [CNTabBarContainer.IconArea] = []
+    for case let bar as CNDotTabBar in [tabBar, tabBarLeft, tabBarRight] where bar.superview === container {
+      let found = bar.touchRegions()
+      regions += found.capsules.map { bar.convert($0, to: container) }
+      for icon in found.icons {
+        // The selection lens holds a second copy of each icon, at the same place.
+        let area = bar.convert(icon.area, to: container).intersection(container.bounds)
+        guard !area.isEmpty, !regions.contains(area) else { continue }
+        regions.append(area)
+        iconAreas.append(CNTabBarContainer.IconArea(area: area, bar: bar, capsuleTop: icon.capsuleTop))
+      }
+    }
+    container.iconAreas = regions.isEmpty ? [] : iconAreas
+    let found: [CGRect]? = regions.isEmpty ? nil : regions
+    guard found != sentTouchRegions else { return }
+    sentTouchRegions = found
+    let args: [[Double]]? = found?.map {
+      [Double($0.minX), Double($0.minY), Double($0.width), Double($0.height)]
+    }
+    channel.invokeMethod("touchRegions", arguments: args)
+  }
+
+  /// How much a custom label is taller than the native 10pt one. The bar
+  /// keeps its height and grows the label up into the icon, so half of
+  /// this moves the icon up and half moves the label down.
+  private var labelExtraHeight: CGFloat {
+    guard hasLabelFont else { return 0 }
+    let size = labelFontSize > 0 ? labelFontSize : 10.0
+    let font = labelFont(size: size, selected: false)
+    return max(0, font.lineHeight - UIFont.systemFont(ofSize: 10, weight: .medium).lineHeight)
+  }
+
+  /// The bar centres an icon's alignment rect, so growing it downwards by
+  /// this much lifts the visible icon by half of it: half of the extra height.
+  private var iconRaise: CGFloat { labelExtraHeight }
+
+  // iOS 26 ignores UITabBarItem.imageInsets but honours an image's alignment rect.
+  private func raised(_ image: UIImage?, by amount: CGFloat) -> UIImage? {
+    guard let image = image, amount != 0 else { return image }
+    var insets = image.alignmentRectInsets
+    insets.bottom -= amount
+    return image.withAlignmentRectInsets(insets)
+  }
+
+  // Only an item with a label needs room for it.
+  private func makeItem(title: String?, image: UIImage?, selectedImage: UIImage?) -> UITabBarItem {
+    let raise = title == nil ? 0 : iconRaise
+    return UITabBarItem(title: title, image: raised(image, by: raise), selectedImage: raised(selectedImage, by: raise))
+  }
+
+  // MARK: - Appearance helpers
+
+  /// Builds a UITabBarAppearance with transparent background and optional custom label font.
+  @available(iOS 13.0, *)
+  private func makeAppearance() -> UITabBarAppearance {
+    let ap = UITabBarAppearance()
+    ap.configureWithTransparentBackground()
+    ap.shadowColor = .clear
+    ap.shadowImage = UIImage()
+    applyLabelFont(to: ap)
+    return ap
+  }
+
+  /// Applies the current label font to a UITabBarAppearance.
+  @available(iOS 13.0, *)
+  private func applyLabelFont(to ap: UITabBarAppearance) {
+    guard hasLabelFont else { return }
+    let size = labelFontSize > 0 ? labelFontSize : 10.0
+    let normal: [NSAttributedString.Key: Any] = [.font: labelFont(size: size, selected: false)]
+    let selected: [NSAttributedString.Key: Any] = [.font: labelFont(size: size, selected: true)]
+    for layout in [ap.stackedLayoutAppearance, ap.inlineLayoutAppearance, ap.compactInlineLayoutAppearance] {
+      layout.normal.titleTextAttributes = normal
+      layout.selected.titleTextAttributes = selected
+    }
+    // Stacked (icon above label): the label moves down as far as the icon
+    // moves up. Inline (side by side, iPad): the label follows the icon up,
+    // which there also moves by half of iconRaise.
+    let stacked = UIOffset(horizontal: 0, vertical: labelExtraHeight / 2 + labelBaselineShift)
+    let inline = UIOffset(horizontal: 0, vertical: -iconRaise / 2 + labelBaselineShift)
+    ap.stackedLayoutAppearance.normal.titlePositionAdjustment = stacked
+    ap.stackedLayoutAppearance.selected.titlePositionAdjustment = stacked
+    for layout in [ap.inlineLayoutAppearance, ap.compactInlineLayoutAppearance] {
+      layout.normal.titlePositionAdjustment = inline
+      layout.selected.titlePositionAdjustment = inline
+    }
+  }
+
+  /// How far a custom family's label moves down to sit where San Francisco's
+  /// would. The bar centres a title's ascent-plus-descent box, so a family
+  /// with a short ascent and a long descent (Tajawal, like many fonts with
+  /// Arabic glyphs: 7.7 and 4.3 pt at 12 pt, against 11.6 and 2.5) drew its
+  /// glyphs about 2.8 pt higher, over the icon (#142). Zero for the system
+  /// font.
+  private var labelBaselineShift: CGFloat {
+    guard labelFontFamily != nil else { return 0 }
+    let size = labelFontSize > 0 ? labelFontSize : 10.0
+    let custom = labelFont(size: size, selected: false)
+    let system = UIFont.systemFont(ofSize: size, weight: .medium)
+    return ((system.ascender + system.descender) - (custom.ascender + custom.descender)) / 2
+  }
+
+  private var hasLabelFont: Bool {
+    labelFontFamily != nil || labelFontSize > 0 || labelFontWeight != nil || selectedLabelFontWeight != nil
+  }
+
+  /// The label font of a normal or a selected tab. The iOS 26 default label
+  /// is SF Medium, and SF Semibold inside the selection pill; a custom family
+  /// gets the same two weights (its nearest faces) unless the app sets them.
+  /// A pubspec font is registered with UIKit the first time (#142).
+  private func labelFont(size: CGFloat, selected: Bool) -> UIFont {
+    let asked = CNFontResolver.weight(fromFlutterValue: selected ? selectedLabelFontWeight : labelFontWeight)
+    let weight = asked ?? (selected ? .semibold : .medium)
+    if let family = labelFontFamily, let font = CNFontResolver.font(family: family, size: size, weight: weight) {
+      return font
+    }
+    return UIFont.systemFont(ofSize: size, weight: weight)
+  }
+
+  private func readItemOptions(_ dict: [String: Any]) {
+    currentSemanticLabels = (dict["semanticLabels"] as? [Any] ?? []).map { ($0 as? String) ?? "" }
+    currentActions = Set((dict["actions"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue })
+  }
+
+  private static func parseMenus(_ value: Any?) -> [[String: Any]?] {
+    return ((value as? [Any]) ?? []).map { $0 as? [String: Any] }
+  }
+
+  /// Gives each bar the menus of its items, which open from a clear button
+  /// over the item and report `menuSelected` with the item's index and the
+  /// path of the chosen entry.
+  private func applyMenus() {
+    let bars: [(UITabBar?, Int)] = tabBar != nil
+      ? [(tabBar, 0)]
+      : [(tabBarLeft, 0), (tabBarRight, tabBarLeft?.items?.count ?? 0)]
+    for (bar, offset) in bars {
+      guard let bar = bar as? CNDotTabBar else { continue }
+      var menus: [Int: UIMenu] = [:]
+      for local in 0..<(bar.items?.count ?? 0) {
+        let index = offset + local
+        guard index < currentMenus.count, let dict = currentMenus[index] else { continue }
+        let children = PopupMenuBuilder.elements(level: PopupMenuLevel(dict: dict), iconScale: iconScale) { [weak self] path in
+          self?.channel.invokeMethod("menuSelected", arguments: ["index": index, "path": path])
+        }
+        menus[local] = UIMenu(title: "", children: children)
+      }
+      bar.itemMenus = menus
+
+      // Action items and accessibility names (#131, #132).
+      var actions = Set<Int>()
+      var actionLabels: [Int: String] = [:]
+      var names: [Int: String] = [:]
+      for (local, item) in (bar.items ?? []).enumerated() {
+        let index = offset + local
+        let name = index < currentSemanticLabels.count ? currentSemanticLabels[index] : ""
+        item.accessibilityLabel = name.isEmpty ? nil : name
+        if !name.isEmpty { names[local] = name }
+        if currentActions.contains(index) {
+          actions.insert(local)
+          if let label = name.isEmpty ? item.title : name { actionLabels[local] = label }
+        }
+      }
+      bar.itemNames = names
+      bar.itemActionLabels = actionLabels
+      bar.itemActions = actions
+      bar.onAction = { [weak self] local in
+        self?.channel.invokeMethod("actionPressed", arguments: ["index": offset + local])
+      }
+    }
+  }
+
+  /// Selects [currentIndex] again. The bar animates it, so the selection
+  /// slides back instead of jumping.
+  private func restoreSelection() {
+    if let bar = self.tabBar, let items = bar.items {
+      bar.selectedItem = currentIndex >= 0 && currentIndex < items.count ? items[currentIndex] : nil
+      return
+    }
+    let leftCount = tabBarLeft?.items?.count ?? 0
+    if currentIndex < leftCount, let items = tabBarLeft?.items {
+      tabBarLeft?.selectedItem = items[currentIndex]
+      tabBarRight?.selectedItem = nil
+    } else if let items = tabBarRight?.items, currentIndex - leftCount < items.count {
+      tabBarRight?.selectedItem = items[currentIndex - leftCount]
+      tabBarLeft?.selectedItem = nil
+    }
+  }
+
+  func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+    // An action item was selected after all: by VoiceOver, by a finger
+    // sliding onto it, or where its button couldn't be placed. Put the
+    // selection back and run the action (#131).
+    if let bar = tabBar as? CNDotTabBar, let items = bar.items,
+       let local = items.firstIndex(of: item), bar.runsAction(at: local) {
+      let index = (bar === tabBarRight ? (tabBarLeft?.items?.count ?? 0) : 0) + local
+      DispatchQueue.main.async { [weak self] in
+        self?.restoreSelection()
+        self?.channel.invokeMethod("actionPressed", arguments: ["index": index])
+      }
+      return
+    }
+    // An item with a menu opens it instead of being selected, but the
+    // bar's own gestures, which also get its button's touches, select it:
+    // put the selection back, report nothing, and open the menu if a
+    // finger slid onto the item rather than tapping its button. After this
+    // call, as the bar finishes selecting the item once it returns.
+    if let bar = tabBar as? CNDotTabBar, let items = bar.items,
+       let local = items.firstIndex(of: item), bar.opensMenu(at: local) {
+      DispatchQueue.main.async { [weak self, weak bar] in
+        self?.restoreSelection()
+        bar?.showMenu(at: local)
+      }
+      return
+    }
+    // Single bar case
+    if let single = self.tabBar, single === tabBar, let items = single.items, let idx = items.firstIndex(of: item) {
+      currentIndex = idx
+      channel.invokeMethod("valueChanged", arguments: ["index": idx])
+      return
+    }
+    // Split left
+    if let left = tabBarLeft, left === tabBar, let items = left.items, let idx = items.firstIndex(of: item) {
+      tabBarRight?.selectedItem = nil
+      currentIndex = idx
+      channel.invokeMethod("valueChanged", arguments: ["index": idx])
+      return
+    }
+    // Split right
+    if let right = tabBarRight, right === tabBar, let items = right.items, let idx = items.firstIndex(of: item), let left = tabBarLeft, let leftItems = left.items {
+      tabBarLeft?.selectedItem = nil
+      currentIndex = leftItems.count + idx
+      channel.invokeMethod("valueChanged", arguments: ["index": leftItems.count + idx])
+      return
+    }
+  }
+
+
+  // Use shared utility functions
+  private static func colorFromARGB(_ argb: Int) -> UIColor {
+    return ImageUtils.colorFromARGB(argb)
+  }
+
+  static func loadFlutterAsset(_ assetPath: String, size: CGSize? = nil) -> UIImage? {
+    return fitted(ImageUtils.loadFlutterAsset(assetPath, size: size), in: size)
+  }
+
+  static func createImageFromData(_ data: Data, format: String?, scale: CGFloat, size: CGSize? = nil) -> UIImage? {
+    return fitted(ImageUtils.createImageFromData(data, format: format, size: size, scale: scale), in: size)
+  }
+
+  /// `image` scaled to fit `size`, keeping its aspect ratio. An SVG comes
+  /// back at the item size already, but a raster asset at its pixel size: a
+  /// 24 pt icon from a `3.0x` folder was drawn 72 pt tall over the bar.
+  private static func fitted(_ image: UIImage?, in size: CGSize?) -> UIImage? {
+    guard let image = image, let box = size, box.width > 0, box.height > 0,
+          image.size.width > 0, image.size.height > 0 else { return image }
+    let factor = min(box.width / image.size.width, box.height / image.size.height)
+    let target = CGSize(width: image.size.width * factor, height: image.size.height * factor)
+    if abs(target.width - image.size.width) < 0.5 && abs(target.height - image.size.height) < 0.5 {
+      return image
+    }
+    let scaled = ImageUtils.scaleImage(image, to: target, scale: UIScreen.main.scale) ?? image
+    return scaled.withRenderingMode(image.renderingMode)
+  }
+
+}
+
+/// The view `CNTabBar` hands Flutter: the bars, 14 pt below its top to leave
+/// room for the Liquid Glass pill.
+///
+/// A bar shorter than its own height draws its icons up past the top of its
+/// capsule, into that room. A touch on that part of an icon hit this bare
+/// view and did nothing, so it goes to the bar instead, at the same x just
+/// inside the capsule's top, and UIKit handles it as a touch on the item:
+/// the glass press and the selection play, and the delegate hears of it.
+/// After PR #162 by @djedi, kept to where an icon draws, so a touch on the
+/// empty room still goes to the content behind the bar.
+final class CNTabBarContainer: UIView {
+  struct IconArea {
+    /// The part of an icon above its capsule, in the container's coordinates.
+    let area: CGRect
+    weak var bar: UITabBar?
+    /// The capsule's top, in the bar's coordinates.
+    let capsuleTop: CGFloat
+  }
+
+  var iconAreas: [IconArea] = []
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    let hit = super.hitTest(point, with: event)
+    guard hit === self,
+          let icon = iconAreas.first(where: { $0.area.contains(point) }),
+          let bar = icon.bar, bar.superview === self else { return hit }
+    let inBar = convert(point, to: bar)
+    return bar.hitTest(CGPoint(x: inBar.x, y: icon.capsuleTop + 1), with: event) ?? hit
+  }
+}
